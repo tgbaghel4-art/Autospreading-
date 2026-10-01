@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================
-#  SMS Queue Bot  —  single file
+#  SMS Queue Bot — Fly.io ready, single file
 #  Workflow:
-#    user uploads .txt → parse numbers → push to Firestore sms_queue
-#    orchestrator polls queue → rotate device every 5 sends → mark sent
+#    upload .txt → parse numbers → push to Firebase sms_queue
+#    orchestrator polls queue → rotate device every N sends → mark sent
 # ============================================================
 print("Starting SMS Queue Bot...")
 
@@ -33,7 +33,7 @@ except ImportError:
 import requests
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, ChatMemberUpdated
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.constants import ParseMode, ChatType, ChatMemberStatus
 from telegram.ext import (
@@ -41,22 +41,31 @@ from telegram.ext import (
     ConversationHandler, ChatMemberHandler, filters, ContextTypes
 )
 
-# ===================== CONFIG =====================
+# ===================== CONFIG (env-first for Fly.io) =====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-DB_FILE = os.path.join(BASE_DIR, "bot_data.db")
-RELOAD_FLAG = os.path.join(BASE_DIR, ".reload_flag")
+SETTINGS_FILE = os.environ.get("SETTINGS_PATH") or os.path.join(BASE_DIR, "settings.json")
+DB_FILE = os.environ.get("DB_PATH") or os.path.join(BASE_DIR, "bot_data.db")
+DATA_DIR = os.path.dirname(DB_FILE) or BASE_DIR
+RELOAD_FLAG = os.environ.get("RELOAD_FLAG") or os.path.join(DATA_DIR, ".reload_flag")
+LOG_FILE = os.environ.get("LOG_PATH") or os.path.join(DATA_DIR, "smsbot.log")
 
 BOT_TOKEN = ""
 CHANNEL_USERNAME = ""
 CHANNEL_TITLE = ""
 CHANNEL_LINK = ""
 ADMIN_IDS: List[int] = []
-BATCH_SIZE = 5              # rotate device after N sends
-POLL_INTERVAL = 8           # orchestrator poll seconds
-SEND_TIMEOUT = 25           # seconds to wait for device ack
+BATCH_SIZE = 5
+POLL_INTERVAL = 8
+SEND_TIMEOUT = 25
 _settings_mtime = 0.0
 _db_mtime = 0.0
+
+
+def _ensure_dirs():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 
 def _load_settings_file() -> dict:
@@ -112,15 +121,16 @@ def reload_runtime_config() -> dict:
     return {"bot_token_set": bool(BOT_TOKEN), "admins": ADMIN_IDS[:], "batch_size": BATCH_SIZE}
 
 
+_ensure_dirs()
 reload_runtime_config()
 
 DEFAULT_USER_CONFIG = {
     "firebase_list": [],
     "active_firebase_index": 0,
-    "devices": [],              # list of device IDs (rotating pool)
+    "devices": [],
     "sim_index": 0,
     "monitored_groups": [],
-    "default_message": "",       # template SMS body
+    "default_message": "",
     "confirm_reply": False,
     "queue_enabled": True,
 }
@@ -134,10 +144,11 @@ banned_set: Set[str] = set()
 cache_lock = threading.RLock()
 
 # ===================== LOGGING =====================
+_ensure_dirs()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[logging.FileHandler("smsbot.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -152,13 +163,6 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS banned (
             user_id TEXT PRIMARY KEY, banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS local_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL, to_number TEXT NOT NULL,
-            message TEXT NOT NULL, device_id TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            sent_at TIMESTAMP)""")
         cur.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     except Exception as e:
@@ -166,6 +170,7 @@ def init_db():
     finally:
         if conn:
             conn.close()
+
 
 def load_cache():
     global user_cache, group_index, banned_set
@@ -182,7 +187,6 @@ def load_cache():
                     for k, v in DEFAULT_USER_CONFIG.items():
                         if k not in cfg:
                             cfg[k] = copy.deepcopy(v)
-                    # normalize firebase_list
                     fb_list = []
                     for fb in cfg.get("firebase_list", []):
                         if isinstance(fb, str):
@@ -192,7 +196,6 @@ def load_cache():
                             fb_list.append(fb)
                     cfg["firebase_list"] = fb_list
                     cfg["devices"] = [str(d) for d in cfg.get("devices", [])]
-                    # migrate legacy single device_id
                     if cfg.get("device_id") and cfg["device_id"] not in cfg["devices"]:
                         cfg["devices"].append(str(cfg["device_id"]))
                     groups = []
@@ -217,6 +220,7 @@ def load_cache():
                 conn.close()
         logger.info(f"✅ cache: {len(user_cache)} users | {len(group_index)} groups")
 
+
 def get_user_config(user_id: int) -> dict:
     uid = str(user_id)
     with cache_lock:
@@ -226,6 +230,7 @@ def get_user_config(user_id: int) -> dict:
         user_cache[uid] = copy.deepcopy(cfg)
     _save_to_db(uid, cfg)
     return cfg
+
 
 def save_user_config(user_id: int, cfg: dict):
     uid = str(user_id)
@@ -244,6 +249,7 @@ def save_user_config(user_id: int, cfg: dict):
             group_index.setdefault(gid, set()).add(uid)
     _save_to_db(uid, cfg)
 
+
 def _save_to_db(uid: str, cfg: dict):
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -254,8 +260,10 @@ def _save_to_db(uid: str, cfg: dict):
     except Exception as e:
         logger.error(f"DB save: {e}")
 
+
 def is_banned(user_id: int) -> bool:
     return str(user_id) in banned_set
+
 
 def ban_user(user_id: int):
     uid = str(user_id)
@@ -268,6 +276,7 @@ def ban_user(user_id: int):
     except Exception as e:
         logger.error(f"ban: {e}")
 
+
 def unban_user(user_id: int):
     uid = str(user_id)
     with cache_lock:
@@ -279,8 +288,10 @@ def unban_user(user_id: int):
     except Exception as e:
         logger.error(f"unban: {e}")
 
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
 
 def get_stats():
     with cache_lock:
@@ -291,6 +302,7 @@ def get_stats():
             if cfg.get("queue_enabled", True) and cfg.get("devices"):
                 act += 1
         return total, fb, gr, act, len(banned_set)
+
 
 def remove_group_from_all_users(group_id: str):
     group_id = str(group_id)
@@ -305,6 +317,7 @@ def remove_group_from_all_users(group_id: str):
         group_index.pop(group_id, None)
     for uid, cfg in to_save:
         _save_to_db(uid, cfg)
+
 
 def update_group_title(group_id: str, new_title: str):
     group_id = str(group_id); to_save = []
@@ -321,12 +334,13 @@ def update_group_title(group_id: str, new_title: str):
     for uid, cfg in to_save:
         _save_to_db(uid, cfg)
 
-# ===================== FIREBASE HELPERS =====================
+# ===================== FIREBASE =====================
 FIREBASE_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/firebase.database"
 ]
 _token_cache: Dict[str, Tuple[str, float]] = {}
+
 
 def get_service_account_token(sa_info: dict) -> Optional[str]:
     if not HAS_GOOGLE_AUTH or not isinstance(sa_info, dict):
@@ -349,6 +363,7 @@ def get_service_account_token(sa_info: dict) -> Optional[str]:
         logger.error(f"SA token: {e}")
     return None
 
+
 def normalize_firebase_base(url: str) -> str:
     url = (url or "").strip()
     if not url: return ""
@@ -363,6 +378,7 @@ def normalize_firebase_base(url: str) -> str:
     except Exception:
         return url.rstrip("/")
 
+
 def parse_firebase_input(text: str) -> Tuple[str, str]:
     text = (text or "").strip()
     try:
@@ -374,6 +390,7 @@ def parse_firebase_input(text: str) -> Tuple[str, str]:
     except Exception:
         pass
     return normalize_firebase_base(text), ""
+
 
 def clean_database_secret(raw: str) -> str:
     s = (raw or "").strip()
@@ -391,15 +408,17 @@ def clean_database_secret(raw: str) -> str:
                 s = line; break
     return s.strip()
 
+
 def validate_firebase_url(url: str) -> bool:
     u = (url or "").strip()
     return u.startswith(("https://", "http://"))
 
-def test_firebase_auth(base_url: str, secret: str = "", service_account: Optional[dict] = None) -> Tuple[bool, str]:
+
+def test_firebase_auth(base_url: str, secret: str = "", service_account_info: Optional[dict] = None) -> Tuple[bool, str]:
     base = normalize_firebase_base(base_url)
     if not base: return False, "Invalid Firebase URL"
     headers: dict = {}; params: dict = {}
-    sa = service_account if isinstance(service_account, dict) else None
+    sa = service_account_info if isinstance(service_account_info, dict) else None
     if sa and sa.get("private_key"):
         token = get_service_account_token(sa)
         if not token: return False, "Service Account OAuth failed"
@@ -424,18 +443,19 @@ def test_firebase_auth(base_url: str, secret: str = "", service_account: Optiona
     except Exception as e:
         return False, f"Error: {e}"
 
+
 def validate_phone_number(phone: str) -> bool:
     c = (phone or "").strip()
     if not c: return False
     if re.match(r'^[\d]{6,}$', c): return True
     return bool(re.match(r'^\+?[\d\-\s\(\)]{7,}$', c))
 
-def extract_json_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def extract_json_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg: return None, None
     if msg.document:
         try:
-            f = await_file = None
             file = await context.bot.get_file(msg.document.file_id)
             content = (await file.download_as_bytearray()).decode("utf-8", errors="ignore").strip()
             return json.loads(content), None
@@ -448,6 +468,7 @@ def extract_json_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try: return json.loads(text), None
         except json.JSONDecodeError: return None, "Invalid JSON"
     return None, None
+
 
 def parse_service_account_dict(data: dict):
     if not isinstance(data, dict):
@@ -465,6 +486,7 @@ def parse_service_account_dict(data: dict):
         return True, pid, f"https://{pid}-default-rtdb.firebaseio.com", None
     return False, None, None, "Valid Service Account JSON nahi hai"
 
+
 def get_active_firebase_entry(user_cfg: dict) -> dict:
     lst = user_cfg.get("firebase_list", [])
     idx = user_cfg.get("active_firebase_index", 0)
@@ -472,6 +494,7 @@ def get_active_firebase_entry(user_cfg: dict) -> dict:
         it = lst[idx]
         return {"url": it, "secret": "", "service_account": None} if isinstance(it, str) else it
     return {}
+
 
 def get_firebase_request_params(user_cfg: dict, path: str) -> Tuple[str, dict]:
     entry = get_active_firebase_entry(user_cfg)
@@ -495,6 +518,7 @@ def get_firebase_request_params(user_cfg: dict, path: str) -> Tuple[str, dict]:
         url = f"{url}{sep}{urllib.parse.urlencode(params)}"
     return url, headers
 
+
 def fetch_json(url: str, headers: dict = None, retries: int = 2, timeout: int = 8) -> dict:
     for attempt in range(retries + 1):
         try:
@@ -515,6 +539,7 @@ def fetch_json(url: str, headers: dict = None, retries: int = 2, timeout: int = 
             logger.error(f"fetch: {e}"); break
     return {}
 
+
 def put_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) -> Tuple[bool, str]:
     try:
         r = requests.put(url, json=payload, headers=headers or {}, timeout=timeout)
@@ -528,8 +553,8 @@ def put_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) ->
     except Exception as e:
         return False, str(e)[:120]
 
+
 def post_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) -> Tuple[bool, str, dict]:
-    """POST to Firebase (auto-generates key). Returns (ok, msg, response_json)."""
     try:
         r = requests.post(url, json=payload, headers=headers or {}, timeout=timeout)
         if 200 <= r.status_code < 300:
@@ -544,6 +569,7 @@ def post_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) -
     except Exception as e:
         return False, str(e)[:120], {}
 
+
 def patch_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) -> Tuple[bool, str]:
     try:
         r = requests.patch(url, json=payload, headers=headers or {}, timeout=timeout)
@@ -553,12 +579,13 @@ def patch_json(url: str, payload: dict, headers: dict = None, timeout: int = 8) 
     except Exception as e:
         return False, str(e)[:120]
 
-# ===================== DEVICE HELPERS =====================
+# ===================== DEVICE =====================
 def _to_ms_ts(val) -> Optional[float]:
     try: fv = float(val)
     except Exception: return None
     if fv < 1e12: fv *= 1000.0
     return fv
+
 
 def is_device_online(data: dict, now_ms: float = None) -> bool:
     if not isinstance(data, dict): return False
@@ -583,6 +610,7 @@ def is_device_online(data: dict, now_ms: float = None) -> bool:
         if ms is not None and (now_ms - ms) < window: return True
     return False
 
+
 def device_display_meta(data: dict) -> Tuple[str, str, bool]:
     if not isinstance(data, dict): return "", "", False
     model = (data.get("deviceModel") or data.get("modelName") or data.get("model")
@@ -590,6 +618,7 @@ def device_display_meta(data: dict) -> Tuple[str, str, bool]:
     phone = (data.get("phoneNumber") or data.get("mobNo") or data.get("mobile")
              or data.get("number") or data.get("msisdn") or "")
     return str(model).strip(), str(phone).strip(), is_device_online(data)
+
 
 def fetch_all_devices(user_cfg: dict) -> Dict[str, dict]:
     merged: Dict[str, dict] = {}
@@ -610,10 +639,12 @@ def fetch_all_devices(user_cfg: dict) -> Dict[str, dict]:
                 merged[did_s] = data
     return merged
 
+
 def get_online_devices(user_cfg: dict) -> Dict[str, dict]:
     devs = fetch_all_devices(user_cfg)
     now = time.time() * 1000
     return {str(d): v for d, v in devs.items() if is_device_online(v, now)}
+
 
 def get_device_data(user_cfg: dict, did: str) -> dict:
     did = str(did)
@@ -623,6 +654,7 @@ def get_device_data(user_cfg: dict, did: str) -> dict:
         data = fetch_json(url, headers=headers, timeout=10)
         if data and isinstance(data, dict): return data
     return {}
+
 
 def extract_sims(device_data: dict) -> List[dict]:
     if not isinstance(device_data, dict):
@@ -646,24 +678,21 @@ def extract_sims(device_data: dict) -> List[dict]:
         if out: return out
     return [{"index": 0, "label": "📶 SIM 1"}, {"index": 1, "label": "📶 SIM 2"}]
 
-# ===================== SMS SEND (direct) =====================
+# ===================== SMS =====================
 def _send_sms_sync(user_cfg: dict, device_id: str, to: str, msg: str) -> Tuple[bool, str, str]:
-    """Returns (ok, reason, message_key). Writes to clients/devices webhookEvent."""
     if not device_id: return False, "No device", ""
     sim = user_cfg.get("sim_index", 0)
     now_ms = int(time.time() * 1000)
-    payload = {
-        "from": sim, "to": to.strip(), "message": msg.strip(),
-        "isSended": False, "sendOk": False, "cmdId": now_ms,
-    }
+    payload = {"from": sim, "to": to.strip(), "message": msg.strip(),
+               "isSended": False, "sendOk": False, "cmdId": now_ms}
     attempts = [
-        (f"clients/{device_id}/webhookEvent/sendSms.json", "put"),
-        (f"devices/{device_id}/webhookEvent/sendSms.json", "put"),
-        (f"devices/{device_id}/actions/sendSms.json", "put"),
-        (f"clients/{device_id}/actions/sendSms.json", "put"),
+        f"clients/{device_id}/webhookEvent/sendSms.json",
+        f"devices/{device_id}/webhookEvent/sendSms.json",
+        f"devices/{device_id}/actions/sendSms.json",
+        f"clients/{device_id}/actions/sendSms.json",
     ]
     last = "No Firebase"
-    for path, _ in attempts:
+    for path in attempts:
         url, headers = get_firebase_request_params(user_cfg, path)
         if not url: continue
         ok, reason = put_json(url, payload, headers=headers, timeout=SEND_TIMEOUT)
@@ -675,40 +704,28 @@ def _send_sms_sync(user_cfg: dict, device_id: str, to: str, msg: str) -> Tuple[b
             return False, reason, path
     return False, last, ""
 
-async def send_sms_async(user_cfg: dict, device_id: str, to: str, msg: str) -> Tuple[bool, str, str]:
+
+async def send_sms_async(user_cfg: dict, device_id: str, to: str, msg: str):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _send_sms_sync, user_cfg, device_id, to, msg)
 
-# ===================== QUEUE PUSH (Firestore-like via RTDB) =====================
+# ===================== QUEUE =====================
 def push_numbers_to_queue_sync(user_cfg: dict, numbers: List[str], message: str, device_id: str) -> Tuple[bool, str, int]:
-    """
-    Push numbers to Firebase sms_queue (RTDB collection-style).
-    Each entry: sms_queue/{autoId} = {to, message, device_id, status:'pending', createdAt}
-    Returns (ok, reason, count_pushed).
-    """
-    if not numbers:
-        return False, "No numbers", 0
+    if not numbers: return False, "No numbers", 0
     queue_url, headers = get_firebase_request_params(user_cfg, "sms_queue.json")
-    if not queue_url:
-        return False, "No active Firebase", 0
-
+    if not queue_url: return False, "No active Firebase", 0
     pushed = 0
     for num in numbers:
         payload = {
-            "to": num,
-            "message": message,
-            "device_id": device_id or "",
-            "status": "pending",
-            "createdAt": int(time.time() * 1000),
-            "attempts": 0,
-            "sent_at": 0,
+            "to": num, "message": message, "device_id": device_id or "",
+            "status": "pending", "createdAt": int(time.time() * 1000),
+            "attempts": 0, "sent_at": 0,
         }
         ok, reason, _ = post_json(queue_url, payload, headers=headers, timeout=10)
-        if ok:
-            pushed += 1
-        else:
-            logger.warning(f"queue push fail {num}: {reason}")
+        if ok: pushed += 1
+        else: logger.warning(f"queue push fail {num}: {reason}")
     return pushed > 0, f"pushed {pushed}/{len(numbers)}", pushed
+
 
 async def push_numbers_to_queue(user_cfg: dict, numbers: List[str], message: str, device_id: str):
     loop = asyncio.get_running_loop()
@@ -717,8 +734,8 @@ async def push_numbers_to_queue(user_cfg: dict, numbers: List[str], message: str
 # ===================== PARSER =====================
 PHONE_REGEX = re.compile(r'\+?\d[\d\s\-\(\)]{5,}\d')
 
+
 def parse_numbers_from_text(text: str) -> List[str]:
-    """Extract phone numbers from txt file. Dedup, preserve order."""
     seen = set(); out = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -732,8 +749,8 @@ def parse_numbers_from_text(text: str) -> List[str]:
                 seen.add(cleaned); out.append(cleaned)
     return out
 
+
 def parse_message(text: str):
-    """Legacy group-message parser (kept for group monitoring)."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     m = next((l for l in lines if l.startswith("🏷️ MESSAGE")), None)
     r = next((l for l in lines if l.startswith("🏷️ RECIPIENT")), None)
@@ -765,6 +782,7 @@ def get_main_keyboard(user_cfg: dict):
         resize_keyboard=True
     )
 
+
 FIREBASE_SUB = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🌐 Add Public Firebase"), KeyboardButton("🔒 Add Private Firebase")],
@@ -773,6 +791,7 @@ FIREBASE_SUB = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
 
 GROUP_SUB = ReplyKeyboardMarkup(
     [[KeyboardButton("➕ Add Group"), KeyboardButton("➖ Delete Group")],
@@ -789,6 +808,7 @@ async def is_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return m.status not in ("left", "kicked")
     except Exception:
         return True
+
 
 async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
@@ -826,7 +846,6 @@ def build_status_text(user_cfg: dict) -> str:
     groups = user_cfg.get("monitored_groups", [])
     tpl = user_cfg.get("default_message", "")
     tpl_show = (tpl[:60] + "…") if len(tpl) > 60 else (tpl or "Not set")
-
     msg = (
         f"📊 **Your Status**\n"
         f"🌐 Active Firebase: `{active_fb}`\n"
@@ -841,7 +860,7 @@ def build_status_text(user_cfg: dict) -> str:
     msg += (
         f"🔔 Reply: {'ON' if user_cfg.get('confirm_reply') else 'OFF'}\n"
         f"🚀 Queue: {'ON' if user_cfg.get('queue_enabled', True) else 'OFF'}\n"
-        f"🔄 Batch rotate every: {BATCH_SIZE} sends"
+        f"🔄 Batch rotate: every {BATCH_SIZE} sends"
     )
     return msg
 
@@ -853,6 +872,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 **Stats**\n👥 Users: `{t}`\n🌐 Firebases: `{fb}`\n"
         f"📢 Groups: `{gr}`\n🤖 Active: `{act}`\n🚫 Banned: `{ban}`",
         parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
@@ -868,6 +888,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.03)
     await st.edit_text(f"✅ Done\nOK: {ok}\nFail: {fail}")
 
+
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not context.args: return
     try:
@@ -876,17 +897,20 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ban_user(tid); await update.message.reply_text(f"🚫 Banned `{tid}`")
     except Exception: pass
 
+
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not context.args: return
     try:
         unban_user(int(context.args[0])); await update.message.reply_text(f"✅ Unbanned `{context.args[0]}`")
     except Exception: pass
 
+
 async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     b = sorted(banned_set)
     await update.message.reply_text("🚫 Banned:\n" + "\n".join(f"`{u}`" for u in b) if b else "No banned users",
                                     parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not context.args: return
@@ -898,6 +922,7 @@ async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Devices: `{len(cfg.get('devices',[]))}`\nGroups: `{len(cfg.get('monitored_groups',[]))}`\n"
         f"Queue: `{'ON' if cfg.get('queue_enabled',True) else 'OFF'}`",
         parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_deleteuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id) or not context.args: return
@@ -919,6 +944,18 @@ async def cmd_deleteuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 # ===================== CONVERSATION =====================
+MENU_BUTTONS = {
+    "📊 Status", "📁 Manage Firebase", "📱 Devices", "📶 SIM", "👥 Group",
+    "✉️ Message Template",
+    "🔔 Start Reply", "🔔 Stop Reply",
+    "▶️ Start Queue", "⏸️ Stop Queue",
+    "🌐 Add Public Firebase", "🔒 Add Private Firebase",
+    "🗑️ Delete Firebase", "📋 Select Firebase",
+    "➕ Add Group", "➖ Delete Group", "📋 Select Group", "🔙 Back",
+    "🚀 Upload Numbers (.txt)",
+}
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return ConversationHandler.END
     cfg = get_user_config(update.effective_user.id)
@@ -928,13 +965,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard(cfg), parse_mode=ParseMode.MARKDOWN)
     return MAIN_MENU
 
+
 async def prompt_device_selection(update, context, user_cfg, msg_prefix: str = ""):
     online = get_online_devices(user_cfg)
     if not online:
         all_devs = fetch_all_devices(user_cfg)
         if not all_devs:
-            txt = (f"{msg_prefix}\n\n" if msg_prefix else "") + \
-                  "📱 <i>No devices found in Firebase.</i>"
+            txt = (f"{msg_prefix}\n\n" if msg_prefix else "") + "📱 <i>No devices found in Firebase.</i>"
             if update.callback_query and update.callback_query.message:
                 await update.callback_query.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard(user_cfg))
             elif update.message:
@@ -985,12 +1022,10 @@ async def prompt_device_selection(update, context, user_cfg, msg_prefix: str = "
     if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"device_page|{page-1}"))
     if page < max_page: nav.append(InlineKeyboardButton("➡️", callback_data=f"device_page|{page+1}"))
     if nav: kb.append(nav)
-
     kb.append([InlineKeyboardButton("✏️ Manual Device ID", callback_data="device_manual")])
     kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="device_cancel")])
     markup = InlineKeyboardMarkup(kb)
-    heading = (f"{msg_prefix}\n\n" if msg_prefix else "") + \
-              f"📱 <b>Select Device</b> ({showing}: <b>{total}</b>)"
+    heading = (f"{msg_prefix}\n\n" if msg_prefix else "") + f"📱 <b>Select Device</b> ({showing}: <b>{total}</b>)"
     if update.callback_query and update.callback_query.message:
         try:
             await update.callback_query.message.edit_text(heading, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -999,17 +1034,6 @@ async def prompt_device_selection(update, context, user_cfg, msg_prefix: str = "
     elif update.message:
         await update.message.reply_text(heading, parse_mode=ParseMode.HTML, reply_markup=markup)
 
-# ===================== MAIN MENU HANDLER =====================
-MENU_BUTTONS = {
-    "📊 Status", "📁 Manage Firebase", "📱 Devices", "📶 SIM", "👥 Group",
-    "✉️ Message Template",
-    "🔔 Start Reply", "🔔 Stop Reply",
-    "▶️ Start Queue", "⏸️ Stop Queue",
-    "🌐 Add Public Firebase", "🔒 Add Private Firebase",
-    "🗑️ Delete Firebase", "📋 Select Firebase",
-    "➕ Add Group", "➖ Delete Group", "📋 Select Group", "🔙 Back",
-    "🚀 Upload Numbers (.txt)",
-}
 
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return ConversationHandler.END
@@ -1088,10 +1112,8 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cfg.get("devices"):
             await update.message.reply_text("❌ Add at least one device first.", reply_markup=get_main_keyboard(cfg)); return MAIN_MENU
         await update.message.reply_text(
-            "📄 Send a `.txt` file with one phone number per line.\n"
-            "Optional: after upload you'll be asked to confirm.",
+            "📄 Send a `.txt` file with one phone number per line.",
             parse_mode=ParseMode.MARKDOWN)
-        context.user_data["awaiting_txt"] = True
         return MAIN_MENU
 
     if text == "🌐 Add Public Firebase":
@@ -1187,11 +1209,12 @@ async def add_public_firebase_handler(update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard(cfg))
     return MAIN_MENU
 
+
 async def _save_private_and_prompt(update, context, uid, cfg, *, url, secret="",
-                                   service_account=None, project_id="", mode_label="🔒 Private"):
+                                   service_account_info=None, project_id="", mode_label="🔒 Private"):
     base = normalize_firebase_base(url)
     sec = clean_database_secret(secret) if secret else ""
-    sa = service_account if isinstance(service_account, dict) else None
+    sa = service_account_info if isinstance(service_account_info, dict) else None
     loop = asyncio.get_running_loop()
     ok, reason = await loop.run_in_executor(None, lambda: test_firebase_auth(base, sec, sa))
     msg = update.message
@@ -1218,6 +1241,7 @@ async def _save_private_and_prompt(update, context, uid, cfg, *, url, secret="",
         parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard(cfg))
     return MAIN_MENU
 
+
 async def add_private_firebase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return ConversationHandler.END
     text = (update.message.text or "").strip()
@@ -1239,7 +1263,7 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
         pending = context.user_data.get("pending_firebase_url") or ""
         use_url = normalize_firebase_base(pending) if pending else default_url
         return await _save_private_and_prompt(update, context, uid, cfg,
-            url=use_url, service_account=json_data, project_id=pid or "",
+            url=use_url, service_account_info=json_data, project_id=pid or "",
             mode_label="🔒 Private (Service Account Key)")
 
     if not text:
@@ -1268,6 +1292,7 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
         parse_mode=ParseMode.HTML)
     return ADD_FIREBASE_SECRET
 
+
 async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return ConversationHandler.END
     text = (update.message.text or "").strip()
@@ -1280,7 +1305,6 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
     if not url:
         await update.message.reply_text("❌ Session expired. Start again.", reply_markup=get_main_keyboard(cfg))
         return MAIN_MENU
-
     json_data, json_err = await extract_json_from_message(update, context)
     if json_data:
         is_valid, pid, default_url, sa_err = parse_service_account_dict(json_data)
@@ -1288,9 +1312,8 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
             await update.message.reply_text(sa_err or "Invalid SA JSON", parse_mode=ParseMode.MARKDOWN)
             return ADD_FIREBASE_SECRET
         return await _save_private_and_prompt(update, context, uid, cfg,
-            url=url or default_url, service_account=json_data, project_id=pid or "",
+            url=url or default_url, service_account_info=json_data, project_id=pid or "",
             mode_label="🔒 Private (Service Account Key)")
-
     secret = clean_database_secret(text)
     if not secret:
         await update.message.reply_text("❌ Empty secret.")
@@ -1338,6 +1361,7 @@ async def add_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Forward a message or send @username.", reply_markup=get_main_keyboard(cfg))
     return MAIN_MENU
 
+
 async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return ConversationHandler.END
     text = (update.message.text or "").strip()
@@ -1349,6 +1373,7 @@ async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(f"✅ Device `{text}` added.", parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=get_main_keyboard(cfg))
     return MAIN_MENU
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_user_config(update.effective_user.id)
@@ -1379,6 +1404,7 @@ async def device_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"✅ Device `{did}` added to pool.\nTotal devices: {len(cfg['devices'])}",
                               parse_mode=ParseMode.MARKDOWN)
 
+
 async def sim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return
     q = update.callback_query; await q.answer()
@@ -1388,6 +1414,7 @@ async def sim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, idx = q.data.split("|", 1)
     cfg["sim_index"] = int(idx); save_user_config(uid, cfg)
     await q.edit_message_text(f"📶 SIM {int(idx)+1} selected.")
+
 
 async def firebase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return
@@ -1419,6 +1446,7 @@ async def firebase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["active_firebase_index"] = idx; save_user_config(uid, cfg)
             await q.edit_message_text("✅ Active Firebase updated.")
 
+
 async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return
     q = update.callback_query; await q.answer()
@@ -1438,35 +1466,29 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data.startswith("sel_group|"):
         await q.edit_message_text("📌 Monitored.")
 
-# ===================== TXT UPLOAD HANDLER =====================
+# ===================== TXT UPLOAD =====================
 async def txt_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle .txt document upload → parse → confirm → push to queue."""
     if not await require_access(update, context): return
     uid = update.effective_user.id
     cfg = get_user_config(uid)
     msg = update.message
-    if not msg.document:
-        return
+    if not msg.document: return
     doc = msg.document
     fname = (doc.file_name or "").lower()
     if not (fname.endswith(".txt") or fname.endswith(".csv")):
         await msg.reply_text("❌ Only .txt / .csv files accepted.")
         return
-
     try:
         file = await context.bot.get_file(doc.file_id)
         raw = (await file.download_as_bytearray()).decode("utf-8", errors="ignore")
     except Exception as e:
         await msg.reply_text(f"❌ Download failed: {e}")
         return
-
     numbers = parse_numbers_from_text(raw)
     if not numbers:
         await msg.reply_text("❌ No valid phone numbers found in file.")
         return
-
     context.user_data["pending_numbers"] = numbers
-    context.user_data["pending_numbers_msg"] = cfg.get("default_message", "")
     preview = "\n".join(numbers[:10])
     await msg.reply_text(
         f"📄 Parsed <b>{len(numbers)}</b> numbers (deduped).\n\n"
@@ -1479,10 +1501,10 @@ async def txt_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Push to Queue", callback_data="push_confirm")],
-            [InlineKeyboardButton("✉️ Change Template", callback_data="push_change_tpl")],
             [InlineKeyboardButton("❌ Cancel", callback_data="push_cancel")],
         ])
     )
+
 
 async def push_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return
@@ -1496,7 +1518,6 @@ async def push_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await q.edit_message_text("❌ Set a message template first (✉️ Message Template)."); return
     if not cfg.get("devices"):
         await q.edit_message_text("❌ Add at least one device first."); return
-
     await q.edit_message_text(f"⏳ Pushing {len(numbers)} numbers to Firebase queue...")
     ok, reason, pushed = await push_numbers_to_queue(cfg, numbers, template, cfg["devices"][0])
     context.user_data.pop("pending_numbers", None)
@@ -1508,16 +1529,6 @@ async def push_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await q.edit_message_text(f"❌ Push failed: {reason}")
 
-async def push_change_tpl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_access(update, context): return
-    q = update.callback_query; await q.answer()
-    context.user_data["awaiting_template"] = True
-    await q.edit_message_text(
-        "✉️ Send new SMS text.\n"
-        "Use `{number}` placeholder to inject each recipient number.\n\n"
-        "After saving, re-upload the .txt file."
-    )
-    context.user_data.pop("pending_numbers", None)
 
 async def push_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context): return
@@ -1525,7 +1536,7 @@ async def push_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data.pop("pending_numbers", None)
     await q.edit_message_text("Cancelled.")
 
-# ===================== GROUP / CHANNEL MESSAGE (legacy inline send) =====================
+# ===================== GROUP MESSAGE (legacy) =====================
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg: return
@@ -1545,12 +1556,10 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not cfg: continue
         if not cfg.get("queue_enabled", True): continue
         if not cfg.get("devices"): continue
-        # Enqueue via queue (respects rotation) rather than direct send
         asyncio.create_task(push_numbers_to_queue(cfg, [to_num], sms, cfg["devices"][0]))
 
 # ===================== ORCHESTRATOR =====================
 class DeviceRotator:
-    """Tracks per-user send count and rotates device every BATCH_SIZE sends."""
     def __init__(self):
         self._counters: Dict[str, int] = {}
         self._current_idx: Dict[str, int] = {}
@@ -1575,10 +1584,11 @@ class DeviceRotator:
             self._counters.pop(uid, None)
             self._current_idx.pop(uid, None)
 
+
 rotator = DeviceRotator()
 
+
 def fetch_pending_jobs_sync(user_cfg: dict, limit: int = 30) -> List[Tuple[str, dict]]:
-    """Return list of (job_key, job_data) for status=='pending' from sms_queue."""
     url, headers = get_firebase_request_params(user_cfg, "sms_queue.json")
     if not url: return []
     blob = fetch_json(url, headers=headers, timeout=15)
@@ -1591,49 +1601,42 @@ def fetch_pending_jobs_sync(user_cfg: dict, limit: int = 30) -> List[Tuple[str, 
         if len(out) >= limit: break
     return out
 
+
 def mark_job_sent_sync(user_cfg: dict, job_key: str, device_id: str) -> Tuple[bool, str]:
     url, headers = get_firebase_request_params(user_cfg, f"sms_queue/{job_key}.json")
     if not url: return False, "no url"
-    payload = {
-        "status": "sent",
-        "device_id": device_id,
-        "sent_at": int(time.time() * 1000),
-    }
-    return patch_json(url, payload, headers=headers, timeout=8)
+    return patch_json(url, {"status": "sent", "device_id": device_id,
+                            "sent_at": int(time.time() * 1000)}, headers=headers, timeout=8)
+
 
 def mark_job_failed_sync(user_cfg: dict, job_key: str, reason: str, attempts: int) -> Tuple[bool, str]:
     url, headers = get_firebase_request_params(user_cfg, f"sms_queue/{job_key}.json")
     if not url: return False, "no url"
-    payload = {
+    return patch_json(url, {
         "status": "failed" if attempts >= 3 else "pending",
         "last_error": reason[:200],
         "attempts": attempts + 1,
         "last_attempt_at": int(time.time() * 1000),
-    }
-    return patch_json(url, payload, headers=headers, timeout=8)
+    }, headers=headers, timeout=8)
+
 
 async def orchestrator_tick(context: ContextTypes.DEFAULT_TYPE):
-    """Poll each enabled user's queue, send pending jobs, rotate devices."""
     with cache_lock:
         snapshot = [(uid, copy.deepcopy(cfg)) for uid, cfg in user_cache.items()]
-
     for uid, cfg in snapshot:
         if uid in banned_set: continue
         if not cfg.get("queue_enabled", True): continue
         devices = cfg.get("devices", [])
         if not devices: continue
         if not cfg.get("firebase_list"): continue
-
         loop = asyncio.get_running_loop()
         try:
             jobs = await loop.run_in_executor(None, fetch_pending_jobs_sync, cfg, 30)
         except Exception as e:
             logger.warning(f"orchestrator fetch {uid}: {e}")
             continue
-        if not jobs:
-            continue
-
-        logger.info(f"🚀 Orchestrator: user {uid} has {len(jobs)} pending job(s)")
+        if not jobs: continue
+        logger.info(f"🚀 user {uid} has {len(jobs)} pending job(s)")
         for job_key, job in jobs:
             to = str(job.get("to") or "").strip()
             msg_text = str(job.get("message") or "").strip()
@@ -1641,15 +1644,10 @@ async def orchestrator_tick(context: ContextTypes.DEFAULT_TYPE):
             if not to or not msg_text:
                 await loop.run_in_executor(None, mark_job_failed_sync, cfg, job_key, "empty to/message", attempts)
                 continue
-
-            # template placeholder substitution
             if "{number}" in msg_text:
                 msg_text = msg_text.replace("{number}", to)
-
             device = rotator.pick_device(uid, devices)
-            if not device:
-                continue
-
+            if not device: continue
             ok, reason, _ = await send_sms_async(cfg, device, to, msg_text)
             if ok:
                 await loop.run_in_executor(None, mark_job_sent_sync, cfg, job_key, device)
@@ -1657,12 +1655,10 @@ async def orchestrator_tick(context: ContextTypes.DEFAULT_TYPE):
             else:
                 await loop.run_in_executor(None, mark_job_failed_sync, cfg, job_key, reason, attempts)
                 logger.warning(f"❌ job {job_key} → {to}: {reason}")
-                rotator.reset(uid)  # force rotation next tick on failures
-
-            # small throttle between sends
+                rotator.reset(uid)
             await asyncio.sleep(1.2)
 
-# ===================== CHAT MEMBER AUTO-CLEAN =====================
+# ===================== AUTO-CLEAN =====================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = update.my_chat_member
     if not r: return
@@ -1675,7 +1671,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}", exc_info=context.error)
 
-# ===================== PANEL WATCHER =====================
+# ===================== PANEL WATCH =====================
 async def watch_panel_changes(context: ContextTypes.DEFAULT_TYPE):
     global _settings_mtime, _db_mtime
     try:
@@ -1746,15 +1742,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(firebase_callback, pattern=r"^(del_fb|confirm_del_fb|sel_fb)"))
     app.add_handler(CallbackQueryHandler(group_callback, pattern=r"^(remove_group|confirm_remove|sel_group|remove_cancel|sel_group_cancel)"))
     app.add_handler(CallbackQueryHandler(push_confirm_callback, pattern=r"^push_confirm$"))
-    app.add_handler(CallbackQueryHandler(push_change_tpl_callback, pattern=r"^push_change_tpl$"))
     app.add_handler(CallbackQueryHandler(push_cancel_callback, pattern=r"^push_cancel$"))
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-
-    # .txt uploads (private + groups)
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, txt_upload_handler))
-
-    # group message legacy hook (for monitored-group inline forwarding)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (
             filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.ChatType.CHANNEL),
@@ -1767,7 +1758,7 @@ async def main():
     if app.job_queue:
         app.job_queue.run_repeating(orchestrator_tick, interval=POLL_INTERVAL, first=6)
         app.job_queue.run_repeating(watch_panel_changes, interval=4, first=3)
-        logger.info(f"⏱️ Orchestrator tick every {POLL_INTERVAL}s | panel watch 4s")
+        logger.info(f"⏱️ Orchestrator every {POLL_INTERVAL}s | watch 4s")
     else:
         logger.warning("job_queue missing — install python-telegram-bot[job-queue]")
 
@@ -1789,6 +1780,7 @@ async def main():
     await app.stop()
     await app.shutdown()
     logger.info("Bot stopped.")
+
 
 if __name__ == "__main__":
     try:
